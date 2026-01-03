@@ -1,0 +1,3 @@
+[submodule "data/armenian-keywords"]
+	path = data/armenian-keywords
+	url = https://github.com/opendataam/armenian-keywords

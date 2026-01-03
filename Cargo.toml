@@ -1,0 +1,11 @@
+[package]
+name = "hay-museum"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+mimalloc = "0.1.48"
+polars = { version = "0.52.0", features = ["lazy", "timezones", "parquet", "strings", "find_many", "is_in", "json", "new_streaming"] }
+regex = "1.12.2"
+rust-stemmers = "1.2.0"
