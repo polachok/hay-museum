@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Error, anyhow};
 use polars::prelude::*;
+use polars::lazy::dsl::by_name;
 use rust_stemmers::{Algorithm, Stemmer};
 
 use mimalloc::MiMalloc;
@@ -80,7 +81,11 @@ fn load_filters(path: &str) -> Result<Filters, Error> {
 
 fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
     // Exclude Armenian surnames that are identical to common Russian words
-    let russian_stopwords = vec!["потеря", "крестья"];
+    // and Russian first names incorrectly listed as Armenian surnames
+    let russian_stopwords = vec!["потеря", "крестья", "емельян"];
+
+    // Also exclude stems that would match Russian patronymics
+    let problematic_stems = vec!["василь"];  // from Васильян, matches Васильевич
 
     let rechunked = series.rechunk();
     let stemmed: Vec<String> = rechunked
@@ -89,8 +94,10 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
         .filter_map(|opt_val| {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
-                // Filter out short stems (< 6 characters) and Russian stopwords
-                if stem.chars().count() >= 6 && !russian_stopwords.contains(&stem.as_str()) {
+                // Filter out short stems, Russian stopwords, and problematic stems
+                if stem.chars().count() >= 6
+                    && !russian_stopwords.contains(&stem.as_str())
+                    && !problematic_stems.contains(&stem.as_str()) {
                     Some(stem)
                 } else {
                     None
@@ -103,12 +110,25 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
     // Exclude Armenian surnames that are identical to common Russian words
-    let russian_stopwords = vec!["потеря", "крестья"];
+    // and Russian first names incorrectly listed as Armenian surnames
+    let russian_stopwords = vec!["потеря", "крестья", "емельян"];
+
+    // Common Russian patronymics that cause false positives with Armenian surnames
+    // Only include those that actually collide (e.g., Васильевич collides with Васильян)
+    let russian_patronymics = vec![
+        "васильевич", "васильевна",  // from Василий, collides with Васильян surname
+    ];
 
     text.split(|c: char| !c.is_alphabetic())
         .filter(|word| !word.is_empty())
         .filter_map(|word| {
             let lower = word.to_lowercase();
+
+            // Skip specific Russian patronymics that cause false positives
+            if russian_patronymics.contains(&lower.as_str()) {
+                return None;
+            }
+
             let stem = stemmer.stem(&lower).into_owned();
             if stem.chars().count() >= 6 && !russian_stopwords.contains(&stem.as_str()) {
                 Some(stem)
@@ -205,7 +225,6 @@ fn preprocess_parquet(input_path: &str, output_path: &str) -> Result<(), Error> 
 
 trait ExprExt {
     fn contains_word_case_insensitive(self, included: &Series) -> Expr;
-    fn contains_any_substring(self, included: &Series) -> Expr;
 }
 
 impl ExprExt for Expr {
@@ -219,34 +238,6 @@ impl ExprExt for Expr {
                 .join("|")
         );
         self.str().contains(lit(pattern), true)
-    }
-
-    fn contains_any_substring(self, included: &Series) -> Expr {
-        const CHUNK_SIZE: usize = 500;
-
-        let terms: Vec<String> = included
-            .iter()
-            .map(|any| regex::escape(any.str_value().as_ref()))
-            .collect();
-
-        // If small enough, use single regex (no word boundaries, case-insensitive)
-        if terms.len() <= CHUNK_SIZE {
-            let pattern = format!("(?i)({})", terms.join("|"));
-            return self.str().contains(lit(pattern), true);
-        }
-
-        // Otherwise, chunk and OR together
-        let mut expr: Option<Expr> = None;
-        for chunk in terms.chunks(CHUNK_SIZE) {
-            let pattern = format!("(?i)({})", chunk.join("|"));
-            let chunk_expr = self.clone().str().contains(lit(pattern), true);
-            expr = Some(match expr {
-                None => chunk_expr,
-                Some(e) => e.or(chunk_expr),
-            });
-        }
-
-        expr.unwrap()
     }
 }
 
@@ -282,20 +273,20 @@ fn main() -> Result<(), Error> {
                 // name filtering using stemmed word lists with fast is_in()
                 .or(col("name_stemmed")
                     .list()
-                    .eval(col("").is_in(lit(description_filter.clone()), false))
+                    .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
                     .list()
                     .sum()
                     .gt(0))
                 .or(col("description_stemmed")
                     .list()
-                    .eval(col("").is_in(lit(description_filter.clone()), false))
+                    .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
                     .list()
                     .sum()
                     .gt(0)),
         );
 
     let _ = lf
-        .limit(1000)
+        .drop(by_name(["name_stemmed", "description_stemmed"], false))
         .with_new_streaming(true)
         .sink_json(
             SinkTarget::Path(PlPath::from_str("test.csv")),
@@ -303,7 +294,7 @@ fn main() -> Result<(), Error> {
             None,
             Default::default(),
         )?
-        .collect_with_engine(Engine::Streaming);
+        .collect_with_engine(Engine::Streaming)?;
 
     Ok(())
 }
