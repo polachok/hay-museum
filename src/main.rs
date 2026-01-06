@@ -82,10 +82,14 @@ fn load_filters(path: &str) -> Result<Filters, Error> {
 fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
     // Exclude Armenian surnames that are identical to common Russian words
     // and Russian first names incorrectly listed as Armenian surnames
-    let russian_stopwords = vec!["потеря", "крестья", "емельян"];
+    let russian_stopwords = vec!["потеря", "крестья", "емельян", "емелья"];
 
-    // Also exclude stems that would match Russian patronymics
-    let problematic_stems = vec!["василь"];  // from Васильян, matches Васильевич
+    // Also exclude stems that would match Russian patronymics and Russian proper names
+    let problematic_stems = vec![
+        "василь",   // from Васильян, matches Васильевич
+        "грабар",   // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
+        "андрия",   // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
+    ];
 
     let rechunked = series.rechunk();
     let stemmed: Vec<String> = rechunked
@@ -111,7 +115,7 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
     // Exclude Armenian surnames that are identical to common Russian words
     // and Russian first names incorrectly listed as Armenian surnames
-    let russian_stopwords = vec!["потеря", "крестья", "емельян"];
+    let russian_stopwords = vec!["потеря", "крестья", "емельян", "емелья", "грабар", "андрия"];
 
     // Common Russian patronymics that cause false positives with Armenian surnames
     // Only include those that actually collide (e.g., Васильевич collides with Васильян)
