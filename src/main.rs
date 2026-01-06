@@ -89,6 +89,10 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
         "василь",   // from Васильян, matches Васильевич
         "грабар",   // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
         "андрия",   // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
+        "демья",    // from Демьян (Armenian surname), matches Демьян (Russian first name)
+        "татья",    // from Татьян (Armenian surname), matches Татьяна (Russian first name)
+        "оловя",    // from Оловян (Armenian surname), matches оловянный (Russian: tin/pewter - very common in museum items)
+        "сафья",    // from Сафьян (Armenian surname), matches сафьян (Russian: morocco leather - common in book bindings)
     ];
 
     let rechunked = series.rechunk();
@@ -99,7 +103,7 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
                 // Filter out short stems, Russian stopwords, and problematic stems
-                if stem.chars().count() >= 6
+                if stem.chars().count() >= 5
                     && !russian_stopwords.contains(&stem.as_str())
                     && !problematic_stems.contains(&stem.as_str()) {
                     Some(stem)
@@ -115,12 +119,23 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
     // Exclude Armenian surnames that are identical to common Russian words
     // and Russian first names incorrectly listed as Armenian surnames
-    let russian_stopwords = vec!["потеря", "крестья", "емельян", "емелья", "грабар", "андрия"];
+    let russian_stopwords = vec!["потеря", "крестья", "емельян", "емелья", "грабар", "андрия", "демья", "татья", "оловя", "сафья"];
 
     // Common Russian patronymics that cause false positives with Armenian surnames
     // Only include those that actually collide (e.g., Васильевич collides with Васильян)
     let russian_patronymics = vec![
         "васильевич", "васильевна",  // from Василий, collides with Васильян surname
+    ];
+
+    // Common Russian words that collide with Armenian name stems
+    let russian_common_words = vec![
+        "торосы", "торосов", "торосам", "торосами", "торосах",  // ice ridges (plural/oblique cases) - collides with Armenian name Торос
+        // Note: "торос" (singular nominative) is NOT blacklisted as it could be the Armenian name
+
+        "григорий", "григория", "григорию", "григорием", "григорье",  // Russian first name Gregory - collides with Григорян surname
+
+        "тиграи", "тиграев", "тиграям", "тиграями", "тиграях",  // Tigray people (Ethiopia) - collides with Armenian name Тигран
+        "тиграй", "тиграйцы", "тиграйца", "тиграйцев", "тиграйцам",
     ];
 
     text.split(|c: char| !c.is_alphabetic())
@@ -133,8 +148,13 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
                 return None;
             }
 
+            // Skip common Russian words that collide with Armenian stems
+            if russian_common_words.contains(&lower.as_str()) {
+                return None;
+            }
+
             let stem = stemmer.stem(&lower).into_owned();
-            if stem.chars().count() >= 6 && !russian_stopwords.contains(&stem.as_str()) {
+            if stem.chars().count() >= 5 && !russian_stopwords.contains(&stem.as_str()) {
                 Some(stem)
             } else {
                 None
