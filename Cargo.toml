@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 mimalloc = "0.1.48"
-phf = { version = "0.11", features = ["macros"] }
+phf = { version = "0.13", features = ["macros"] }
 polars = { version = "0.52.0", features = ["lazy", "timezones", "parquet", "strings", "find_many", "is_in", "json", "new_streaming", "concat_str", "object"] }
 regex = "1.12.2"
 rust-stemmers = "1.2.0"
