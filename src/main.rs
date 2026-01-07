@@ -15,6 +15,20 @@ use bert_classifier::BertClassifier;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// Exclude stems that match Russian words, names, and patronymics
+// to prevent false positives with Armenian surnames
+static RUSSIAN_STOPWORDS: phf::Set<&'static str> = phf_set! {
+    "потеря", "крестья", "емельян", "емелья",
+    "василь", // from Васильян, matches Васильевич
+    "грабар", // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
+    "андрия", // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
+    "демья",  // from Демьян (Armenian surname), matches Демьян (Russian first name)
+    "татья",  // from Татьян (Armenian surname), matches Татьяна (Russian first name)
+    "оловя", // from Оловян (Armenian surname), matches оловянный (Russian: tin/pewter - very common in museum items)
+    "сафья", // from Сафьян (Armenian surname), matches сафьян (Russian: morocco leather - common in book bindings)
+    "арсень", // from Арсеньев (Russian surname), matches Armenian name Арсен
+};
+
 struct Filters {
     names: Series,
     midnames: Series,
@@ -85,23 +99,6 @@ fn load_filters(path: &str) -> Result<Filters, Error> {
 }
 
 fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
-    // Exclude Armenian surnames that are identical to common Russian words
-    // and Russian first names incorrectly listed as Armenian surnames
-    static RUSSIAN_STOPWORDS: phf::Set<&'static str> = phf_set! {
-        "потеря", "крестья", "емельян", "емелья"
-    };
-
-    // Also exclude stems that would match Russian patronymics and Russian proper names
-    static PROBLEMATIC_STEMS: phf::Set<&'static str> = phf_set! {
-        "василь", // from Васильян, matches Васильевич
-        "грабар", // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
-        "андрия", // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
-        "демья",  // from Демьян (Armenian surname), matches Демьян (Russian first name)
-        "татья",  // from Татьян (Armenian surname), matches Татьяна (Russian first name)
-        "оловя", // from Оловян (Armenian surname), matches оловянный (Russian: tin/pewter - very common in museum items)
-        "сафья", // from Сафьян (Armenian surname), matches сафьян (Russian: morocco leather - common in book bindings)
-    };
-
     let rechunked = series.rechunk();
     let stemmed: Vec<String> = rechunked
         .str()?
@@ -109,10 +106,9 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
         .filter_map(|opt_val| {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
-                // Filter out short stems, Russian stopwords, and problematic stems
+                // Filter out short stems and Russian stopwords
                 if stem.chars().count() >= 5
                     && !RUSSIAN_STOPWORDS.contains(stem.as_str())
-                    && !PROBLEMATIC_STEMS.contains(stem.as_str())
                 {
                     Some(stem)
                 } else {
@@ -125,21 +121,6 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 }
 
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
-    // Exclude Armenian surnames that are identical to common Russian words
-    // and Russian first names incorrectly listed as Armenian surnames
-    static RUSSIAN_STOPWORDS: phf::Set<&'static str> = phf_set! {
-        "потеря",
-        "крестья",
-        "емельян",
-        "емелья",
-        "грабар",
-        "андрия",
-        "демья",
-        "татья",
-        "оловя",
-        "сафья",
-    };
-
     // Common Russian patronymics that cause false positives with Armenian surnames
     // Only include those that actually collide (e.g., Васильевич collides with Васильян)
     static RUSSIAN_PATRONYMICS: phf::Set<&'static str> = phf_set! {
