@@ -336,11 +336,19 @@ fn main() -> Result<(), Error> {
 
     let lf = LazyFrame::scan_parquet(PlPath::from_str(preprocessed_path), Default::default())?
         // Add column to track if matched by geonames (reliable, no BERT needed)
+        // Only match if field is not null and contains geoname pattern
         .with_column(
-            col("productionPlace")
-                .contains_word_case_insensitive(&filters.geonames)
-                .or(col("findPlace").contains_word_case_insensitive(&filters.geonames))
-                .alias("matched_geonames"),
+            (col("productionPlace")
+                .is_not_null()
+                .and(col("productionPlace").str().len_bytes().gt(0))
+                .and(col("productionPlace").contains_word_case_insensitive(&filters.geonames)))
+            .or(
+                col("findPlace")
+                    .is_not_null()
+                    .and(col("findPlace").str().len_bytes().gt(0))
+                    .and(col("findPlace").contains_word_case_insensitive(&filters.geonames))
+            )
+            .alias("matched_geonames"),
         )
         // Add column to track if matched by keywords/names (needs BERT validation)
         .with_column(
