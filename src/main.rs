@@ -1,11 +1,15 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Error, anyhow};
-use polars::prelude::*;
 use polars::lazy::dsl::by_name;
+use polars::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
 use mimalloc::MiMalloc;
+
+mod bert_classifier;
+use bert_classifier::BertClassifier;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -82,17 +86,17 @@ fn load_filters(path: &str) -> Result<Filters, Error> {
 fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
     // Exclude Armenian surnames that are identical to common Russian words
     // and Russian first names incorrectly listed as Armenian surnames
-    let russian_stopwords = vec!["потеря", "крестья", "емельян", "емелья"];
+    let russian_stopwords = ["потеря", "крестья", "емельян", "емелья"];
 
     // Also exclude stems that would match Russian patronymics and Russian proper names
-    let problematic_stems = vec![
-        "василь",   // from Васильян, matches Васильевич
-        "грабар",   // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
-        "андрия",   // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
-        "демья",    // from Демьян (Armenian surname), matches Демьян (Russian first name)
-        "татья",    // from Татьян (Armenian surname), matches Татьяна (Russian first name)
-        "оловя",    // from Оловян (Armenian surname), matches оловянный (Russian: tin/pewter - very common in museum items)
-        "сафья",    // from Сафьян (Armenian surname), matches сафьян (Russian: morocco leather - common in book bindings)
+    let problematic_stems = [
+        "василь", // from Васильян, matches Васильевич
+        "грабар", // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
+        "андрия", // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
+        "демья",  // from Демьян (Armenian surname), matches Демьян (Russian first name)
+        "татья",  // from Татьян (Armenian surname), matches Татьяна (Russian first name)
+        "оловя", // from Оловян (Armenian surname), matches оловянный (Russian: tin/pewter - very common in museum items)
+        "сафья", // from Сафьян (Armenian surname), matches сафьян (Russian: morocco leather - common in book bindings)
     ];
 
     let rechunked = series.rechunk();
@@ -105,7 +109,8 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
                 // Filter out short stems, Russian stopwords, and problematic stems
                 if stem.chars().count() >= 5
                     && !russian_stopwords.contains(&stem.as_str())
-                    && !problematic_stems.contains(&stem.as_str()) {
+                    && !problematic_stems.contains(&stem.as_str())
+                {
                     Some(stem)
                 } else {
                     None
@@ -119,23 +124,49 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
     // Exclude Armenian surnames that are identical to common Russian words
     // and Russian first names incorrectly listed as Armenian surnames
-    let russian_stopwords = vec!["потеря", "крестья", "емельян", "емелья", "грабар", "андрия", "демья", "татья", "оловя", "сафья"];
+    let russian_stopwords = [
+        "потеря",
+        "крестья",
+        "емельян",
+        "емелья",
+        "грабар",
+        "андрия",
+        "демья",
+        "татья",
+        "оловя",
+        "сафья",
+    ];
 
     // Common Russian patronymics that cause false positives with Armenian surnames
     // Only include those that actually collide (e.g., Васильевич collides with Васильян)
-    let russian_patronymics = vec![
-        "васильевич", "васильевна",  // from Василий, collides with Васильян surname
+    let russian_patronymics = [
+        "васильевич",
+        "васильевна", // from Василий, collides with Васильян surname
     ];
 
     // Common Russian words that collide with Armenian name stems
-    let russian_common_words = vec![
-        "торосы", "торосов", "торосам", "торосами", "торосах",  // ice ridges (plural/oblique cases) - collides with Armenian name Торос
+    let russian_common_words = [
+        "торосы",
+        "торосов",
+        "торосам",
+        "торосами",
+        "торосах", // ice ridges (plural/oblique cases) - collides with Armenian name Торос
         // Note: "торос" (singular nominative) is NOT blacklisted as it could be the Armenian name
-
-        "григорий", "григория", "григорию", "григорием", "григорье",  // Russian first name Gregory - collides with Григорян surname
-
-        "тиграи", "тиграев", "тиграям", "тиграями", "тиграях",  // Tigray people (Ethiopia) - collides with Armenian name Тигран
-        "тиграй", "тиграйцы", "тиграйца", "тиграйцев", "тиграйцам",
+        "григорий",
+        "григория",
+        "григорию",
+        "григорием",
+        "григорье", // Russian first name Gregory - collides with Григорян surname
+        "тиграи",
+        "тиграев",
+        "тиграям",
+        "тиграями",
+        "тиграях", // Tigray people (Ethiopia) - collides with Armenian name Тигран
+        "тиграй",
+        "тиграйцы",
+        "тиграйца",
+        "тиграйцев",
+        "тиграйцам",
     ];
 
     text.split(|c: char| !c.is_alphabetic())
@@ -179,60 +210,60 @@ fn preprocess_parquet(input_path: &str, output_path: &str) -> Result<(), Error> 
             ..Default::default()
         },
     )?
-        .with_column(
-            col("name")
-                .map(
-                    move |col: Column| {
-                        let s = col.as_materialized_series();
-                        let values: Vec<AnyValue> = s
-                            .str()?
-                            .into_iter()
-                            .map(|opt_val| {
-                                let words = opt_val
-                                    .map(|val| stem_text_to_words(val, &stemmer_clone1))
-                                    .unwrap_or_default();
-                                let word_series = Series::from_iter(words);
-                                AnyValue::List(word_series)
-                            })
-                            .collect();
-                        Ok(Series::from_any_values(s.name().clone(), &values, false)?.into())
-                    },
-                    |_schema, _fields| {
-                        Ok(Field::new(
-                            "name_stemmed".into(),
-                            DataType::List(Box::new(DataType::String)),
-                        ))
-                    },
-                )
-                .alias("name_stemmed"),
-        )
-        .with_column(
-            col("description")
-                .map(
-                    move |col: Column| {
-                        let s = col.as_materialized_series();
-                        let values: Vec<AnyValue> = s
-                            .str()?
-                            .into_iter()
-                            .map(|opt_val| {
-                                let words = opt_val
-                                    .map(|val| stem_text_to_words(val, &stemmer_clone2))
-                                    .unwrap_or_default();
-                                let word_series = Series::from_iter(words);
-                                AnyValue::List(word_series)
-                            })
-                            .collect();
-                        Ok(Series::from_any_values(s.name().clone(), &values, false)?.into())
-                    },
-                    |_schema, _fields| {
-                        Ok(Field::new(
-                            "description_stemmed".into(),
-                            DataType::List(Box::new(DataType::String)),
-                        ))
-                    },
-                )
-                .alias("description_stemmed"),
-        );
+    .with_column(
+        col("name")
+            .map(
+                move |col: Column| {
+                    let s = col.as_materialized_series();
+                    let values: Vec<AnyValue> = s
+                        .str()?
+                        .into_iter()
+                        .map(|opt_val| {
+                            let words = opt_val
+                                .map(|val| stem_text_to_words(val, &stemmer_clone1))
+                                .unwrap_or_default();
+                            let word_series = Series::from_iter(words);
+                            AnyValue::List(word_series)
+                        })
+                        .collect();
+                    Ok(Series::from_any_values(s.name().clone(), &values, false)?.into())
+                },
+                |_schema, _fields| {
+                    Ok(Field::new(
+                        "name_stemmed".into(),
+                        DataType::List(Box::new(DataType::String)),
+                    ))
+                },
+            )
+            .alias("name_stemmed"),
+    )
+    .with_column(
+        col("description")
+            .map(
+                move |col: Column| {
+                    let s = col.as_materialized_series();
+                    let values: Vec<AnyValue> = s
+                        .str()?
+                        .into_iter()
+                        .map(|opt_val| {
+                            let words = opt_val
+                                .map(|val| stem_text_to_words(val, &stemmer_clone2))
+                                .unwrap_or_default();
+                            let word_series = Series::from_iter(words);
+                            AnyValue::List(word_series)
+                        })
+                        .collect();
+                    Ok(Series::from_any_values(s.name().clone(), &values, false)?.into())
+                },
+                |_schema, _fields| {
+                    Ok(Field::new(
+                        "description_stemmed".into(),
+                        DataType::List(Box::new(DataType::String)),
+                    ))
+                },
+            )
+            .alias("description_stemmed"),
+    );
 
     eprintln!("Writing preprocessed parquet...");
     lf.sink_parquet(
@@ -309,7 +340,37 @@ fn main() -> Result<(), Error> {
                     .gt(0)),
         );
 
+    // Initialize BERT classifier for semantic scoring
+    eprintln!("Initializing BERT classifier...");
+    let mut classifier = BertClassifier::load()?;
+    classifier.create_armenian_prototypes()?;
+    let classifier = Arc::new(classifier);
+
+    const BERT_THRESHOLD: f32 = 0.44;
+
+    // Apply BERT scoring and filtering
+    let classifier_clone = classifier.clone();
     let _ = lf
+        .with_column(
+            concat_str([col("name"), col("description")], " ", true)
+                .map(
+                    move |c: Column| {
+                        let c = c.str()?;
+                        let classifier_clone = classifier_clone.clone();
+                        let res: Float32Chunked = c
+                            .into_iter()
+                            .map(move |text: Option<&str>| -> Option<f32> {
+                                let classifier = classifier_clone.clone();
+                                text.and_then(move |t| classifier.score_armenian_relevance(t).ok())
+                            })
+                            .collect();
+                        Ok(Column::new("armenian_score".into(), res.into_series()))
+                    },
+                    |_, _| Ok(Field::new("armenian_score".into(), DataType::Float32)),
+                )
+                .alias("armenian_score"),
+        )
+        .filter(col("armenian_score").gt_eq(lit(BERT_THRESHOLD)))
         .drop(by_name(["name_stemmed", "description_stemmed"], false))
         .with_new_streaming(true)
         .sink_json(
