@@ -157,6 +157,11 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
         "григорию",
         "григорием",
         "григорье", // Russian first name Gregory - collides with Григорян surname
+        "григорьев",
+        "григорьева",
+        "григорьеву",
+        "григорьевым",
+        "григорьеве", // Russian surname Grigoryev - collides with Григорян surname
         "тиграи",
         "тиграев",
         "тиграям",
@@ -320,25 +325,31 @@ fn main() -> Result<(), Error> {
     eprintln!("Geonames filter terms: {}", filters.geonames.len());
 
     let lf = LazyFrame::scan_parquet(PlPath::from_str(preprocessed_path), Default::default())?
-        .filter(
-            // geographical (word boundaries - fewer terms)
+        // Add column to track if matched by geonames (reliable, no BERT needed)
+        .with_column(
             col("productionPlace")
                 .contains_word_case_insensitive(&filters.geonames)
                 .or(col("findPlace").contains_word_case_insensitive(&filters.geonames))
-                // name filtering using stemmed word lists with fast is_in()
-                .or(col("name_stemmed")
-                    .list()
-                    .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
-                    .list()
-                    .sum()
-                    .gt(0))
+                .alias("matched_geonames"),
+        )
+        // Add column to track if matched by keywords/names (needs BERT validation)
+        .with_column(
+            col("name_stemmed")
+                .list()
+                .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
+                .list()
+                .sum()
+                .gt(0)
                 .or(col("description_stemmed")
                     .list()
                     .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
                     .list()
                     .sum()
-                    .gt(0)),
-        );
+                    .gt(0))
+                .alias("matched_keywords_or_names"),
+        )
+        // Filter to only records that matched something
+        .filter(col("matched_geonames").or(col("matched_keywords_or_names")));
 
     // Initialize BERT classifier for semantic scoring
     eprintln!("Initializing BERT classifier...");
@@ -348,30 +359,35 @@ fn main() -> Result<(), Error> {
 
     const BERT_THRESHOLD: f32 = 0.44;
 
-    // Apply BERT scoring and filtering
+    // Apply BERT scoring ONLY to keyword/name matches (not geoname matches)
     let classifier_clone = classifier.clone();
     let _ = lf
         .with_column(
-            concat_str([col("name"), col("description")], " ", true)
-                .map(
-                    move |c: Column| {
-                        let c = c.str()?;
-                        let classifier_clone = classifier_clone.clone();
-                        let res: Float32Chunked = c
-                            .into_iter()
-                            .map(move |text: Option<&str>| -> Option<f32> {
-                                let classifier = classifier_clone.clone();
-                                text.and_then(move |t| classifier.score_armenian_relevance(t).ok())
-                            })
-                            .collect();
-                        Ok(Column::new("armenian_score".into(), res.into_series()))
-                    },
-                    |_, _| Ok(Field::new("armenian_score".into(), DataType::Float32)),
+            when(col("matched_keywords_or_names").and(col("matched_geonames").not()))
+                .then(
+                    concat_str([col("name"), col("description")], " ", true)
+                        .map(
+                            move |c: Column| {
+                                let c = c.str()?;
+                                let classifier_clone = classifier_clone.clone();
+                                let res: Float32Chunked = c
+                                    .into_iter()
+                                    .map(move |text: Option<&str>| -> Option<f32> {
+                                        let classifier = classifier_clone.clone();
+                                        text.and_then(move |t| classifier.score_armenian_relevance(t).ok())
+                                    })
+                                    .collect();
+                                Ok(Column::new("armenian_score".into(), res.into_series()))
+                            },
+                            |_, _| Ok(Field::new("armenian_score".into(), DataType::Float32)),
+                        ),
                 )
+                .otherwise(lit(1.0f32)) // Geoname matches get perfect score (skip BERT)
                 .alias("armenian_score"),
         )
-        .filter(col("armenian_score").gt_eq(lit(BERT_THRESHOLD)))
-        .drop(by_name(["name_stemmed", "description_stemmed"], false))
+        // Filter: keep all geoname matches, and keyword/name matches above threshold
+        .filter(col("matched_geonames").or(col("armenian_score").gt_eq(lit(BERT_THRESHOLD))))
+        .drop(by_name(["name_stemmed", "description_stemmed", "matched_geonames", "matched_keywords_or_names"], false))
         .with_new_streaming(true)
         .sink_json(
             SinkTarget::Path(PlPath::from_str("test.csv")),
