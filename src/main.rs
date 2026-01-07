@@ -162,6 +162,16 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
         "григорьеву",
         "григорьевым",
         "григорьеве", // Russian surname Grigoryev - collides with Григорян surname
+        "арсений",
+        "арсения",
+        "арсению",
+        "арсением",
+        "арсенье", // Russian first name Arseny - collides with Armenian name Арсен
+        "арсеньев",
+        "арсеньева",
+        "арсеньеву",
+        "арсеньевым",
+        "арсеньеве", // Russian surname Arsenyev - collides with Armenian name Арсен
         "тиграи",
         "тиграев",
         "тиграям",
