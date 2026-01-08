@@ -223,6 +223,11 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
         "лукьяну",
         "лукьяном",
         "лукьяне", // Russian first name Lukyan (from Latin Lucianus) - false positive for Armenian content
+        "бурьян",
+        "бурьяна",
+        "бурьяну",
+        "бурьяном",
+        "бурьяне", // Russian word for "weeds/wild grass" - common in descriptions, not Armenian content
         "трунин",
         "трунина",
         "трунину",
