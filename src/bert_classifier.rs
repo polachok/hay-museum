@@ -147,6 +147,9 @@ impl BertClassifier {
                     "Мартиросян из Армении",
                     "Арутюнян армянское имя",
                     "Григорян Саркисян Оганян",
+                    "Симонян Акопян армянские фамилии",
+                    "Аветисян Казарян Манукян",
+                    "Варданян Степанян Амбарцумян",
                 ],
             ),
         ];
@@ -311,7 +314,7 @@ impl BertClassifier {
         // If russian_similarity > armenian_similarity, reduce the score
         let adjusted_similarity = if russian_similarity > 0.0 {
             // Penalize records that are more Russian than Armenian
-            let penalty = (russian_similarity - armenian_similarity).max(0.0) * 0.3;
+            let penalty = (russian_similarity - armenian_similarity).max(0.0) * 0.2;
             (armenian_similarity - penalty).max(0.0)
         } else {
             armenian_similarity
