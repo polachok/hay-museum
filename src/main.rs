@@ -16,8 +16,9 @@ use bert_classifier::BertClassifier;
 static GLOBAL: MiMalloc = MiMalloc;
 
 // Exclude stems that match Russian words, names, and patronymics
-// to prevent false positives with Armenian surnames
-static RUSSIAN_STOPWORDS: phf::Set<&'static str> = phf_set! {
+// Stems to filter out to prevent false positives with Armenian surnames
+// These are checked AFTER stemming, so values here should be stems
+static RUSSIAN_STEMS: phf::Set<&'static str> = phf_set! {
     "потеря", "крестья", "емельян", "емелья",
     "василь", // from Васильян, matches Васильевич
     "грабар", // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
@@ -106,9 +107,9 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
         .filter_map(|opt_val| {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
-                // Filter out short stems and Russian stopwords
+                // Filter out short stems and Russian stems
                 if stem.chars().count() >= 5
-                    && !RUSSIAN_STOPWORDS.contains(stem.as_str())
+                    && !RUSSIAN_STEMS.contains(stem.as_str())
                 {
                     Some(stem)
                 } else {
@@ -122,10 +123,51 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
     // Common Russian patronymics that cause false positives with Armenian surnames
-    // Only include those that actually collide (e.g., Васильевич collides with Васильян)
     static RUSSIAN_PATRONYMICS: phf::Set<&'static str> = phf_set! {
-        "васильевич",
-        "васильевна", // from Василий, collides with Васильян surname
+        // From Василий (Vasily)
+        "васильевич", "васильевна",
+        // From Иван (Ivan)
+        "иванович", "ивановна",
+        // From Петр (Peter)
+        "петрович", "петровна",
+        // From Александр (Alexander)
+        "александрович", "александровна",
+        // From Дмитрий (Dmitry)
+        "дмитриевич", "дмитриевна",
+        // From Сергей (Sergey)
+        "сергеевич", "сергеевна",
+        // From Михаил (Mikhail)
+        "михайлович", "михайловна",
+        // From Андрей (Andrey)
+        "андреевич", "андреевна",
+        // From Николай (Nikolay)
+        "николаевич", "николаевна",
+        // From Владимир (Vladimir)
+        "владимирович", "владимировна",
+        // From Алексей (Alexey)
+        "алексеевич", "алексеевна",
+        // From Павел (Pavel)
+        "павлович", "павловна",
+        // From Георгий (George)
+        "георгиевич", "георгиевна",
+        // From Борис (Boris)
+        "борисович", "борисовна",
+        // From Юрий (Yuri)
+        "юрьевич", "юрьевна",
+        // From Фёдор (Fyodor)
+        "фёдорович", "фёдоровна", "федорович", "федоровна",
+        // From Степан (Stepan)
+        "степанович", "степановна",
+        // From Константин (Konstantin)
+        "константинович", "константиновна",
+        // From Леонид (Leonid)
+        "леонидович", "леонидовна",
+        // From Евгений (Evgeny)
+        "евгеньевич", "евгеньевна",
+        // From Анатолий (Anatoly)
+        "анатольевич", "анатольевна",
+        // From Виктор (Viktor)
+        "викторович", "викторовна",
     };
 
     // Common Russian words that collide with Armenian name stems
@@ -166,6 +208,57 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
         "тиграйца",
         "тиграйцев",
         "тиграйцам",
+        "николай",
+        "николая",
+        "николаю",
+        "николаем",
+        "николае", // Russian first name Nikolay - collides with Armenian surname Николаян
+        "трунин",
+        "трунина",
+        "трунину",
+        "труниным",
+        "трунине", // Russian surname Trunin - collides with Armenian surname Трунян
+        // Russian cultural figures (painters, writers, public figures) - checked before stemming
+        "головко",     // Арсений Головко - Soviet admiral
+        // NOTE: "левитан" removed - Isaac Levitan (И. И. Левитан 1860-1900) was ethnically Armenian
+        //       His works appear in Armenian galleries, so filtering would lose legitimate content
+        "репин",       // Илья Репин - Russian painter
+        "васнецов",    // Виктор Васнецов - Russian painter
+        "серов",       // Валентин Серов - Russian painter
+        "суриков",     // Василий Суриков - Russian painter
+        "шишкин",      // Иван Шишкин - Russian painter
+        "крамской",    // Иван Крамской - Russian painter
+        "перов",       // Василий Перов - Russian painter
+        "саврасов",    // Алексей Саврасов - Russian painter
+        "лермонтов",   // Mikhail Lermontov - Russian poet
+        "пушкин",      // Alexander Pushkin - Russian poet
+        "достоевский", // Fyodor Dostoevsky - Russian writer
+        "толстой",     // Leo Tolstoy - Russian writer
+        "чехов",       // Anton Chekhov - Russian writer
+        "горький",     // Maxim Gorky - Russian writer
+        "маяковский",  // Vladimir Mayakovsky - Russian poet
+        // Middle Eastern artifacts (not Armenian-specific)
+        "кальян",      // hookah/water pipe - Ottoman/Middle Eastern artifact
+        "кальяна",
+        "кальяну",
+        "кальяном",
+        "кальяне",
+        "кальяны",
+        "кальянов",
+        "кальянам",
+        "кальянами",
+        "кальянах",    // hookah (all case forms) - false positive for Armenian content
+        // Greek archaeological artifacts (not Armenian-specific)
+        "килик",       // kylix - ancient Greek drinking cup
+        "килика",
+        "килику",
+        "киликом",
+        "килике",
+        "килики",
+        "киликов",
+        "киликам",
+        "киликами",
+        "киликах",     // kylix (all case forms) - found in archaeological sites but not Armenian-specific
     };
 
     text.split(|c: char| !c.is_alphabetic())
@@ -184,7 +277,7 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
             }
 
             let stem = stemmer.stem(&lower).into_owned();
-            if stem.chars().count() >= 5 && !RUSSIAN_STOPWORDS.contains(stem.as_str()) {
+            if stem.chars().count() >= 5 && !RUSSIAN_STEMS.contains(stem.as_str()) {
                 Some(stem)
             } else {
                 None
