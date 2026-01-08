@@ -301,10 +301,22 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
         .collect()
 }
 
-fn preprocess_parquet(input_path: &str, output_path: &str) -> Result<(), Error> {
+fn preprocess_parquet(input_path: &str, output_path: &str, filters: &Filters) -> Result<(), Error> {
     use std::sync::Arc;
 
     eprintln!("Preprocessing parquet file...");
+
+    // Prepare filter series for keyword matching
+    let mut description_filter = Series::new_empty("desc".into(), &DataType::String);
+    description_filter.append(&filters.names)?;
+    description_filter.append(&filters.midnames)?;
+    description_filter.append(&filters.surnames)?;
+    description_filter.append(&filters.keywords)?;
+    let description_filter = description_filter.unique()?.rechunk();
+
+    eprintln!("Total filter terms: {}", description_filter.len());
+    eprintln!("Geonames filter terms: {}", filters.geonames.len());
+
     let stemmer = Arc::new(Stemmer::create(Algorithm::Russian));
 
     let stemmer_clone1 = stemmer.clone();
@@ -370,9 +382,41 @@ fn preprocess_parquet(input_path: &str, output_path: &str) -> Result<(), Error> 
                 },
             )
             .alias("description_stemmed"),
-    );
+    )
+    // Add column to track if matched by geonames (reliable, no BERT needed)
+    .with_column(
+        (col("productionPlace")
+            .is_not_null()
+            .and(col("productionPlace").str().len_bytes().gt(0))
+            .and(col("productionPlace").contains_word_case_insensitive(&filters.geonames)))
+        .or(
+            col("findPlace")
+                .is_not_null()
+                .and(col("findPlace").str().len_bytes().gt(0))
+                .and(col("findPlace").contains_word_case_insensitive(&filters.geonames))
+        )
+        .alias("matched_geonames"),
+    )
+    // Add column to track if matched by keywords/names (needs BERT validation)
+    .with_column(
+        col("name_stemmed")
+            .list()
+            .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
+            .list()
+            .sum()
+            .gt(0)
+            .or(col("description_stemmed")
+                .list()
+                .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
+                .list()
+                .sum()
+                .gt(0))
+            .alias("matched_keywords_or_names"),
+    )
+    // Filter to only records that matched something
+    .filter(col("matched_geonames").or(col("matched_keywords_or_names")));
 
-    eprintln!("Writing preprocessed parquet...");
+    eprintln!("Writing preprocessed (filtered) parquet...");
     lf.sink_parquet(
         SinkTarget::Path(PlPath::from_str(output_path)),
         Default::default(),
@@ -406,60 +450,19 @@ impl ExprExt for Expr {
 fn main() -> Result<(), Error> {
     let data_path = "data/data.parquet";
     let preprocessed_path = "data/data-preprocessed.parquet";
-
-    // Preprocess if needed
-    if !std::path::Path::new(preprocessed_path).exists() {
-        eprintln!("Preprocessed file not found, creating it...");
-        preprocess_parquet(data_path, preprocessed_path)?;
-    }
-
     let filters_path = "data/armenian-keywords/data/ru/";
+
+    // Load filters (needed for preprocessing)
     let filters = load_filters(filters_path)?;
 
-    let mut description_filter = Series::new_empty("desc".into(), &DataType::String);
-    description_filter.append(&filters.names)?;
-    description_filter.append(&filters.midnames)?;
-    description_filter.append(&filters.surnames)?;
-    description_filter.append(&filters.keywords)?;
-    let description_filter = description_filter.unique()?.rechunk();
+    // Preprocess if needed (now includes keyword/geoname filtering)
+    if !std::path::Path::new(preprocessed_path).exists() {
+        eprintln!("Preprocessed file not found, creating it...");
+        preprocess_parquet(data_path, preprocessed_path, &filters)?;
+    }
 
-    eprintln!("Total filter terms: {}", description_filter.len());
-    eprintln!("Geonames filter terms: {}", filters.geonames.len());
-
-    let lf = LazyFrame::scan_parquet(PlPath::from_str(preprocessed_path), Default::default())?
-        // Add column to track if matched by geonames (reliable, no BERT needed)
-        // Only match if field is not null and contains geoname pattern
-        .with_column(
-            (col("productionPlace")
-                .is_not_null()
-                .and(col("productionPlace").str().len_bytes().gt(0))
-                .and(col("productionPlace").contains_word_case_insensitive(&filters.geonames)))
-            .or(
-                col("findPlace")
-                    .is_not_null()
-                    .and(col("findPlace").str().len_bytes().gt(0))
-                    .and(col("findPlace").contains_word_case_insensitive(&filters.geonames))
-            )
-            .alias("matched_geonames"),
-        )
-        // Add column to track if matched by keywords/names (needs BERT validation)
-        .with_column(
-            col("name_stemmed")
-                .list()
-                .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
-                .list()
-                .sum()
-                .gt(0)
-                .or(col("description_stemmed")
-                    .list()
-                    .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
-                    .list()
-                    .sum()
-                    .gt(0))
-                .alias("matched_keywords_or_names"),
-        )
-        // Filter to only records that matched something
-        .filter(col("matched_geonames").or(col("matched_keywords_or_names")));
+    // Load preprocessed data (already filtered by keywords/geonames)
+    let lf = LazyFrame::scan_parquet(PlPath::from_str(preprocessed_path), Default::default())?;
 
     // Initialize BERT classifier for semantic scoring
     eprintln!("Initializing BERT classifier...");
@@ -470,7 +473,8 @@ fn main() -> Result<(), Error> {
 
     const BERT_THRESHOLD: f32 = 0.44;
 
-    // Apply BERT scoring ONLY to keyword/name matches (not geoname matches)
+    // Apply BERT scoring to all records
+    // Geoname matches get 1.0, keyword/name matches get BERT scored
     let classifier_clone = classifier.clone();
     let _ = lf
         .with_column(
