@@ -5,24 +5,48 @@ use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
+/// Model type selection for BERT classifier
+#[derive(Debug, Clone, Copy)]
+pub enum ModelType {
+    /// LaBSE: Language-agnostic BERT (109 languages, multilingual)
+    LaBSE,
+    /// Russian BERT: ai-forever/sbert_large_nlu_ru (Russian-specific, 400M params)
+    RuBERT,
+}
+
+impl ModelType {
+    fn model_id(&self) -> &str {
+        match self {
+            ModelType::LaBSE => "sentence-transformers/LaBSE",
+            ModelType::RuBERT => "ai-forever/sbert_large_nlu_ru",
+        }
+    }
+}
+
 pub struct BertClassifier {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
-    armenian_prototypes: Vec<(String, Tensor)>,
+    model_type: ModelType,
+    pub armenian_prototypes: Vec<(String, Tensor)>,
 }
 
 impl BertClassifier {
     /// Load BERT model from HuggingFace Hub
     pub fn load() -> Result<Self> {
-        eprintln!("Loading BERT model...");
+        Self::load_with_model(ModelType::LaBSE)
+    }
+
+    /// Load BERT model with specific model type
+    pub fn load_with_model(model_type: ModelType) -> Result<Self> {
+        eprintln!("Loading BERT model ({:?})...", model_type);
 
         // Auto-detect device: Metal (M1) or CPU
         let device = Self::select_device()?;
         eprintln!("Using device: {:?}", device);
 
-        // Model: LaBSE (Language-agnostic BERT Sentence Encoder)
-        let model_id = "sentence-transformers/LaBSE";
+        // Get model ID based on type
+        let model_id = model_type.model_id();
         let repo = Repo::new(model_id.to_string(), RepoType::Model);
         let api = Api::new()?;
         let repo_api = api.repo(repo);
@@ -55,6 +79,7 @@ impl BertClassifier {
             model,
             tokenizer,
             device,
+            model_type,
             armenian_prototypes,
         })
     }
@@ -76,41 +101,49 @@ impl BertClassifier {
     }
 
     /// Create category-specific Armenian prototype embeddings
+    /// Optimized for museum records with specific names, places, and cultural context
     pub fn create_armenian_prototypes(&mut self) -> Result<()> {
         eprintln!("Creating Armenian prototype embeddings...");
 
         let prototypes = vec![
             (
-                "cultural",
+                "names",
                 vec![
-                    "армянская культура",
-                    "армянское искусство",
-                    "армянское наследие",
+                    "Хачатурян Арам композитор",
+                    "Айвазовский Иван художник",
+                    "Баграмян маршал Советского Союза",
+                    "Микоян Анастас государственный деятель",
+                    "Шагинян Мариэтта писательница",
+                    "Сарьян Мартирос художник",
                 ],
             ),
             (
-                "geographic",
+                "geography",
                 vec![
-                    "Армения",
-                    "Ереван",
-                    "Карабах",
-                    "Закавказье",
+                    "Ереван город Армения",
+                    "Армянская ССР республика",
+                    "Тбилиси Закавказье армяне",
+                    "Нагорный Карабах регион",
+                    "землетрясение в Армении",
                 ],
             ),
             (
-                "historical",
+                "institutions",
                 vec![
-                    "история Армении",
-                    "армянская история",
-                    "армянский народ",
+                    "Государственный театр Армении Сундукяна",
+                    "Картинная галерея Армении Ереван",
+                    "Лазаревский институт армянский",
+                    "армянская церковь монастырь храм",
                 ],
             ),
             (
-                "linguistic",
+                "surnames",
                 vec![
-                    "армянский язык",
-                    "армянский текст",
-                    "армянская письменность",
+                    "Петросян армянская фамилия",
+                    "Гамбарян армянин",
+                    "Мартиросян из Армении",
+                    "Арутюнян армянское имя",
+                    "Григорян Саркисян Оганян",
                 ],
             ),
         ];
@@ -148,7 +181,7 @@ impl BertClassifier {
     }
 
     /// Encode a single text into embedding
-    fn encode_text(&self, text: &str) -> Result<Tensor> {
+    pub fn encode_text(&self, text: &str) -> Result<Tensor> {
         let mut encoding = self.tokenizer
             .encode(text, true)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
