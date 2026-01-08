@@ -476,7 +476,11 @@ fn main() -> Result<(), Error> {
         .with_column(
             when(col("matched_keywords_or_names").and(col("matched_geonames").not()))
                 .then(
-                    concat_str([col("name"), col("description")], " ", true)
+                    concat_str([
+                        col("name"),
+                        col("description"),
+                        col("authors").list().join(lit(" "), true)
+                    ], " ", true)
                         .map(
                             move |c: Column| {
                                 let c = c.str()?;
