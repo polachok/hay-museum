@@ -213,6 +213,11 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
         "николаю",
         "николаем",
         "николае", // Russian first name Nikolay - collides with Armenian surname Николаян
+        "куприян",
+        "куприяна",
+        "куприяну",
+        "куприяном",
+        "куприяне", // Russian first name Kupriyan (from Cyprian) - false positive for Armenian content
         "трунин",
         "трунина",
         "трунину",
