@@ -465,6 +465,7 @@ fn main() -> Result<(), Error> {
     eprintln!("Initializing BERT classifier...");
     let mut classifier = BertClassifier::load()?;
     classifier.create_armenian_prototypes()?;
+    classifier.create_russian_prototypes()?;
     let classifier = Arc::new(classifier);
 
     const BERT_THRESHOLD: f32 = 0.44;

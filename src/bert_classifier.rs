@@ -29,6 +29,7 @@ pub struct BertClassifier {
     device: Device,
     model_type: ModelType,
     pub armenian_prototypes: Vec<(String, Tensor)>,
+    pub russian_prototypes: Vec<(String, Tensor)>,
 }
 
 impl BertClassifier {
@@ -74,6 +75,7 @@ impl BertClassifier {
 
         // Create Armenian prototypes
         let armenian_prototypes = Vec::new(); // Will be populated lazily
+        let russian_prototypes = Vec::new(); // Will be populated lazily
 
         Ok(Self {
             model,
@@ -81,6 +83,7 @@ impl BertClassifier {
             device,
             model_type,
             armenian_prototypes,
+            russian_prototypes,
         })
     }
 
@@ -180,6 +183,73 @@ impl BertClassifier {
         Ok(())
     }
 
+    /// Create Russian/Soviet negative prototypes to filter out non-Armenian content
+    /// These embeddings help distinguish Armenian content from Russian cultural items
+    pub fn create_russian_prototypes(&mut self) -> Result<()> {
+        eprintln!("Creating Russian negative prototype embeddings...");
+
+        let prototypes = vec![
+            (
+                "russian_geography",
+                vec![
+                    "Москва столица Россия",
+                    "Санкт-Петербург Ленинград город",
+                    "Волга река Россия",
+                    "Урал горы Россия",
+                    "Сибирь регион Россия",
+                ],
+            ),
+            (
+                "russian_orthodox",
+                vec![
+                    "русская православная церковь",
+                    "икона Божией Матери Россия",
+                    "православный храм монастырь Россия",
+                    "святой Николай Чудотворец икона",
+                    "преображение господне православие",
+                ],
+            ),
+            (
+                "russian_crafts",
+                vec![
+                    "гжель народные промыслы Россия",
+                    "хохлома роспись русская",
+                    "дымковская игрушка промысел",
+                    "палех лаковая миниатюра Россия",
+                    "жостово поднос роспись русская",
+                ],
+            ),
+        ];
+
+        self.russian_prototypes.clear();
+
+        for (category, phrases) in prototypes {
+            let embeddings: Vec<Tensor> = phrases
+                .iter()
+                .filter_map(|phrase| {
+                    match self.encode_text(phrase) {
+                        Ok(emb) => Some(emb),
+                        Err(e) => {
+                            eprintln!("  Warning: Failed to encode '{}': {}", phrase, e);
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            if embeddings.is_empty() {
+                return Err(anyhow!("Failed to create embeddings for category: {}", category));
+            }
+
+            let avg_embedding = Self::average_tensors(&embeddings)?;
+            self.russian_prototypes.push((category.to_string(), avg_embedding));
+            eprintln!("  Created negative prototype for '{}' category", category);
+        }
+
+        eprintln!("Negative prototype embeddings created successfully!");
+        Ok(())
+    }
+
     /// Encode a single text into embedding
     pub fn encode_text(&self, text: &str) -> Result<Tensor> {
         let mut encoding = self.tokenizer
@@ -221,19 +291,38 @@ impl BertClassifier {
         // Encode the record text
         let record_embedding = self.encode_text(text)?;
 
-        // Calculate max cosine similarity across all prototypes
-        let mut max_similarity = 0.0_f32;
+        // Calculate max cosine similarity across all Armenian prototypes
+        let mut armenian_similarity = 0.0_f32;
         for (_category, prototype) in &self.armenian_prototypes {
             let similarity = Self::cosine_similarity(&record_embedding, prototype)?;
-            max_similarity = max_similarity.max(similarity);
+            armenian_similarity = armenian_similarity.max(similarity);
         }
+
+        // Calculate max cosine similarity with Russian negative prototypes (if available)
+        let mut russian_similarity = 0.0_f32;
+        if !self.russian_prototypes.is_empty() {
+            for (_category, prototype) in &self.russian_prototypes {
+                let similarity = Self::cosine_similarity(&record_embedding, prototype)?;
+                russian_similarity = russian_similarity.max(similarity);
+            }
+        }
+
+        // Apply negative penalty if Russian similarity is high
+        // If russian_similarity > armenian_similarity, reduce the score
+        let adjusted_similarity = if russian_similarity > 0.0 {
+            // Penalize records that are more Russian than Armenian
+            let penalty = (russian_similarity - armenian_similarity).max(0.0) * 0.3;
+            (armenian_similarity - penalty).max(0.0)
+        } else {
+            armenian_similarity
+        };
 
         // Apply Armenian character boost
         let has_armenian = Self::has_armenian_characters(text);
         let final_score = if has_armenian {
-            (max_similarity * 2.0).min(1.0) // Boost by 2x but cap at 1.0
+            (adjusted_similarity * 2.0).min(1.0) // Boost by 2x but cap at 1.0
         } else {
-            max_similarity
+            adjusted_similarity
         };
 
         Ok(final_score)
