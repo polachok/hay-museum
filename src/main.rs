@@ -414,7 +414,9 @@ fn preprocess_parquet(input_path: &str, output_path: &str, filters: &Filters) ->
             .alias("matched_keywords_or_names"),
     )
     // Filter to only records that matched something
-    .filter(col("matched_geonames").or(col("matched_keywords_or_names")));
+    .filter(col("matched_geonames").or(col("matched_keywords_or_names")))
+    // Drop stemmed columns - no longer needed after filtering
+    .drop(by_name(["name_stemmed", "description_stemmed"], false));
 
     eprintln!("Writing preprocessed (filtered) parquet...");
     lf.sink_parquet(
@@ -506,7 +508,8 @@ fn main() -> Result<(), Error> {
         )
         // Filter: keep all geoname matches, and keyword/name matches above threshold
         .filter(col("matched_geonames").or(col("armenian_score").gt_eq(lit(BERT_THRESHOLD))))
-        .drop(by_name(["name_stemmed", "description_stemmed", "matched_geonames", "matched_keywords_or_names"], false))
+        // Drop temporary columns used for filtering
+        .drop(by_name(["matched_geonames", "matched_keywords_or_names"], false))
         .with_new_streaming(true)
         .sink_json(
             SinkTarget::Path(PlPath::from_str("test.csv")),
