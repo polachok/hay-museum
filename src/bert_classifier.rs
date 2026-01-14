@@ -1,25 +1,34 @@
 use anyhow::{anyhow, Result};
-use candle_core::{Device, Tensor};
-use candle_nn::VarBuilder;
+use candle_core::{Device, IndexOp, Module, Tensor};
+use candle_nn::{linear, Linear, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
+use std::path::Path;
 
 /// Model type selection for BERT classifier
 #[derive(Debug, Clone, Copy)]
 pub enum ModelType {
     /// LaBSE: Language-agnostic BERT (109 languages, multilingual)
     LaBSE,
-    /// Russian BERT: ai-forever/sbert_large_nlu_ru (Russian-specific, 400M params)
-    RuBERT,
+    /// RuBERT-tiny2: cointegrated/rubert-tiny2 (Russian-specific, 12M params, fast)
+    #[allow(dead_code)]
+    RuBERTTiny2,
+    /// Fine-tuned RuBERT-mini for Armenian classification (local model)
+    FineTunedArmenian,
 }
 
 impl ModelType {
     fn model_id(&self) -> &str {
         match self {
             ModelType::LaBSE => "sentence-transformers/LaBSE",
-            ModelType::RuBERT => "ai-forever/sbert_large_nlu_ru",
+            ModelType::RuBERTTiny2 => "cointegrated/rubert-tiny2",
+            ModelType::FineTunedArmenian => "py/rubert-mini-armenian/final",
         }
+    }
+
+    fn is_local(&self) -> bool {
+        matches!(self, ModelType::FineTunedArmenian)
     }
 }
 
@@ -27,13 +36,17 @@ pub struct BertClassifier {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
+    #[allow(dead_code)]
     model_type: ModelType,
     pub armenian_prototypes: Vec<(String, Tensor)>,
     pub russian_prototypes: Vec<(String, Tensor)>,
+    /// Classification head for fine-tuned models (None for embedding-only models)
+    classifier: Option<Linear>,
 }
 
 impl BertClassifier {
     /// Load BERT model from HuggingFace Hub
+    #[allow(dead_code)]
     pub fn load() -> Result<Self> {
         Self::load_with_model(ModelType::LaBSE)
     }
@@ -46,21 +59,31 @@ impl BertClassifier {
         let device = Self::select_device()?;
         eprintln!("Using device: {:?}", device);
 
-        // Get model ID based on type
         let model_id = model_type.model_id();
-        let repo = Repo::new(model_id.to_string(), RepoType::Model);
-        let api = Api::new()?;
-        let repo_api = api.repo(repo);
 
-        eprintln!("Downloading model files from HuggingFace...");
-
-        // Download model files
-        let config_path = repo_api.get("config.json")?;
-        let tokenizer_path = repo_api.get("tokenizer.json")?;
-        let weights_path = repo_api.get("model.safetensors")?;
+        // Load from local path or HuggingFace
+        let (config_path, tokenizer_path, weights_path) = if model_type.is_local() {
+            eprintln!("Loading model from local path: {}", model_id);
+            let base_path = Path::new(model_id);
+            (
+                base_path.join("config.json"),
+                base_path.join("tokenizer.json"),
+                base_path.join("model.safetensors"),
+            )
+        } else {
+            eprintln!("Downloading model files from HuggingFace...");
+            let repo = Repo::new(model_id.to_string(), RepoType::Model);
+            let api = Api::new()?;
+            let repo_api = api.repo(repo);
+            (
+                repo_api.get("config.json")?,
+                repo_api.get("tokenizer.json")?,
+                repo_api.get("model.safetensors")?,
+            )
+        };
 
         eprintln!("Loading model configuration...");
-        let config = std::fs::read_to_string(config_path)?;
+        let config = std::fs::read_to_string(&config_path)?;
         let config: Config = serde_json::from_str(&config)?;
 
         eprintln!("Loading tokenizer...");
@@ -69,7 +92,20 @@ impl BertClassifier {
 
         eprintln!("Loading model weights...");
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)? };
-        let model = BertModel::load(vb, &config)?;
+
+        // Load BERT base model
+        let model = BertModel::load(vb.pp("bert"), &config)?;
+
+        // Load classifier head if it's a fine-tuned model
+        let classifier = if matches!(model_type, ModelType::FineTunedArmenian) {
+            eprintln!("Loading classification head...");
+            let hidden_size = config.hidden_size;
+            let num_labels = 2;
+            let classifier = linear(hidden_size, num_labels, vb.pp("classifier"))?;
+            Some(classifier)
+        } else {
+            None
+        };
 
         eprintln!("Model loaded successfully!");
 
@@ -84,6 +120,7 @@ impl BertClassifier {
             model_type,
             armenian_prototypes,
             russian_prototypes,
+            classifier,
         })
     }
 
@@ -203,6 +240,17 @@ impl BertClassifier {
                 ],
             ),
             (
+                "russian_place_names",
+                vec![
+                    "Ясная Поляна усадьба Толстой музей",
+                    "Лесная поляна совхоз деревня",
+                    "Красная поляна село место Россия",
+                    "лесная поляна пейзаж природа Россия",
+                    "поляна сказок музей Ялта Крым",
+                    "поляна лес природа пейзаж",
+                ],
+            ),
+            (
                 "russian_orthodox",
                 vec![
                     "русская православная церковь",
@@ -220,6 +268,49 @@ impl BertClassifier {
                     "дымковская игрушка промысел",
                     "палех лаковая миниатюра Россия",
                     "жостово поднос роспись русская",
+                ],
+            ),
+            (
+                "non_armenian_artists",
+                vec![
+                    "Микеланджело Буонарроти итальянский скульптор",
+                    "Леонардо да Винчи живопись Италия",
+                    "Рафаэль Санти художник Возрождение",
+                    "Рембрандт ван Рейн голландский художник",
+                    "Тициан Вечеллио венецианская живопись",
+                    "Караваджо итальянский барокко живопись",
+                    "Клод Моне французский импрессионизм",
+                    "Огюст Ренуар французский художник",
+                    "Поль Сезанн французская живопись",
+                    "Винсент ван Гог нидерландский художник",
+                    "Пабло Пикассо испанский художник",
+                    "Анри Матисс французский фовизм",
+                    "Илья Репин русский художник передвижник",
+                    "Валентин Серов русская живопись портрет",
+                    "Исаак Левитан русский пейзажист",
+                    "Иван Шишкин русский художник пейзажист",
+                ],
+            ),
+            (
+                "russian_writers",
+                vec![
+                    "Лев Толстой русский писатель Ясная Поляна",
+                    "Федор Достоевский русский писатель романист",
+                    "Антон Чехов русский писатель драматург",
+                    "Александр Пушкин русский поэт писатель",
+                    "Иван Тургенев русский писатель романист",
+                    "Николай Гоголь русский писатель драматург",
+                ],
+            ),
+            (
+                "soviet_currency",
+                vec![
+                    "казначейский билет советский рубль банкнота",
+                    "банкнота государственного банка СССР рубль",
+                    "монета копейка советская чеканка",
+                    "червонец золотая советская монета",
+                    "денежный знак СССР государственный билет",
+                    "рубль копейка советская валюта",
                 ],
             ),
         ];
@@ -259,8 +350,8 @@ impl BertClassifier {
             .encode(text, true)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
 
-        // Truncate to BERT's maximum sequence length (512 tokens)
-        encoding.truncate(512, 0, tokenizers::TruncationDirection::Right);
+        // Truncate to rubert-tiny2's maximum sequence length (1024 tokens)
+        encoding.truncate(1024, 0, tokenizers::TruncationDirection::Right);
 
         let tokens = encoding.get_ids();
         let token_ids = Tensor::new(tokens.to_vec(), &self.device)?
@@ -287,6 +378,12 @@ impl BertClassifier {
 
     /// Score a single record's Armenian relevance
     pub fn score_armenian_relevance(&self, text: &str) -> Result<f32> {
+        // Use fine-tuned classifier if available
+        if let Some(classifier) = &self.classifier {
+            return self.score_with_classifier(text, classifier);
+        }
+
+        // Otherwise use prototype-based scoring
         if self.armenian_prototypes.is_empty() {
             return Err(anyhow!("Armenian prototypes not initialized. Call create_armenian_prototypes() first."));
         }
@@ -314,7 +411,8 @@ impl BertClassifier {
         // If russian_similarity > armenian_similarity, reduce the score
         let adjusted_similarity = if russian_similarity > 0.0 {
             // Penalize records that are more Russian than Armenian
-            let penalty = (russian_similarity - armenian_similarity).max(0.0) * 0.2;
+            // Penalty increased from 0.2 to 0.5 for better filtering
+            let penalty = (russian_similarity - armenian_similarity).max(0.0) * 0.5;
             (armenian_similarity - penalty).max(0.0)
         } else {
             armenian_similarity
@@ -329,6 +427,44 @@ impl BertClassifier {
         };
 
         Ok(final_score)
+    }
+
+    /// Score using fine-tuned classifier
+    fn score_with_classifier(&self, text: &str, classifier: &Linear) -> Result<f32> {
+        // Tokenize and encode
+        let mut encoding = self.tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+        encoding.truncate(1024, 0, tokenizers::TruncationDirection::Right);
+
+        let tokens = encoding.get_ids();
+        let token_ids = Tensor::new(tokens.to_vec(), &self.device)?
+            .unsqueeze(0)?;
+
+        // Forward pass through BERT
+        let token_type_ids = token_ids.zeros_like()?;
+        let embeddings = self.model.forward(&token_ids, &token_type_ids, None)?;
+
+        // Get [CLS] token embedding (first token)
+        let cls_embedding = embeddings.i((0, 0))?; // Shape: [hidden_size]
+        let cls_embedding = cls_embedding.unsqueeze(0)?; // Shape: [1, hidden_size]
+
+        // Pass through classifier
+        let logits = classifier.forward(&cls_embedding)?; // Shape: [1, 2]
+        let logits = logits.squeeze(0)?; // Shape: [2]
+
+        // Get probability for "armenian" class (label 1)
+        // Apply softmax and return probability
+        let logits_vec = logits.to_vec1::<f32>()?;
+        let armenian_logit = logits_vec[1];
+        let not_armenian_logit = logits_vec[0];
+
+        // Softmax: exp(x_i) / sum(exp(x_j))
+        let exp_armenian = armenian_logit.exp();
+        let exp_not_armenian = not_armenian_logit.exp();
+        let prob_armenian = exp_armenian / (exp_armenian + exp_not_armenian);
+
+        Ok(prob_armenian)
     }
 
     /// Score a batch of records

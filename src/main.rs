@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Error, anyhow};
 use phf::phf_set;
@@ -10,7 +11,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 use mimalloc::MiMalloc;
 
 mod bert_classifier;
-use bert_classifier::BertClassifier;
+use bert_classifier::{BertClassifier, ModelType};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -108,7 +109,7 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
                 // Filter out short stems and Russian stems
-                if stem.chars().count() >= 5
+                if stem.chars().count() >= 4
                     && !RUSSIAN_STEMS.contains(stem.as_str())
                 {
                     Some(stem)
@@ -292,7 +293,7 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
             }
 
             let stem = stemmer.stem(&lower).into_owned();
-            if stem.chars().count() >= 5 && !RUSSIAN_STEMS.contains(stem.as_str()) {
+            if stem.chars().count() >= 4 && !RUSSIAN_STEMS.contains(stem.as_str()) {
                 Some(stem)
             } else {
                 None
@@ -468,9 +469,12 @@ fn main() -> Result<(), Error> {
 
     // Initialize BERT classifier for semantic scoring
     eprintln!("Initializing BERT classifier...");
-    let mut classifier = BertClassifier::load()?;
-    classifier.create_armenian_prototypes()?;
-    classifier.create_russian_prototypes()?;
+    let classifier = BertClassifier::load_with_model(ModelType::FineTunedArmenian)?;
+
+    // Fine-tuned model doesn't need prototypes
+    // classifier.create_armenian_prototypes()?;
+    // classifier.create_russian_prototypes()?;
+
     let classifier = Arc::new(classifier);
 
     const BERT_THRESHOLD: f32 = 0.44;
@@ -478,23 +482,38 @@ fn main() -> Result<(), Error> {
     // Apply BERT scoring to all records
     // Geoname matches get 1.0, keyword/name matches get BERT scored
     let classifier_clone = classifier.clone();
+    let progress_counter = Arc::new(AtomicUsize::new(0));
+    let progress_clone = progress_counter.clone();
+
     let _ = lf
         .with_column(
             when(col("matched_keywords_or_names").and(col("matched_geonames").not()))
                 .then(
+                    // Match training data format: use " | " separator and "Автор: " prefix
                     concat_str([
                         col("name"),
                         col("description"),
-                        col("authors").list().join(lit(" "), true)
-                    ], " ", true)
+                        when(col("authors").list().len().gt(0))
+                            .then(concat_str([lit("Автор: "), col("authors").list().join(lit(", "), true)], "", false))
+                            .otherwise(lit("")),
+                    ], " | ", true)
                         .map(
                             move |c: Column| {
                                 let c = c.str()?;
                                 let classifier_clone = classifier_clone.clone();
+                                let progress_clone = progress_clone.clone();
+
                                 let res: Float32Chunked = c
                                     .into_iter()
                                     .map(move |text: Option<&str>| -> Option<f32> {
                                         let classifier = classifier_clone.clone();
+                                        let count = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
+
+                                        // Log progress every 1000 records
+                                        if count.is_multiple_of(1000) {
+                                            eprintln!("Scored {} records", count);
+                                        }
+
                                         text.and_then(move |t| classifier.score_armenian_relevance(t).ok())
                                     })
                                     .collect();
@@ -512,7 +531,7 @@ fn main() -> Result<(), Error> {
         .drop(by_name(["matched_geonames", "matched_keywords_or_names"], false))
         .with_new_streaming(true)
         .sink_json(
-            SinkTarget::Path(PlPath::from_str("test.csv")),
+            SinkTarget::Path(PlPath::from_str("result.json")),
             Default::default(),
             None,
             Default::default(),
