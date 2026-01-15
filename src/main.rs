@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Error, anyhow};
 use phf::phf_set;
@@ -123,54 +122,6 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
 }
 
 fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> impl Iterator<Item = String> {
-    // Common Russian patronymics that cause false positives with Armenian surnames
-    static RUSSIAN_PATRONYMICS: phf::Set<&'static str> = phf_set! {
-        // From Василий (Vasily)
-        "васильевич", "васильевна",
-        // From Иван (Ivan)
-        "иванович", "ивановна",
-        // From Петр (Peter)
-        "петрович", "петровна",
-        // From Александр (Alexander)
-        "александрович", "александровна",
-        // From Дмитрий (Dmitry)
-        "дмитриевич", "дмитриевна",
-        // From Сергей (Sergey)
-        "сергеевич", "сергеевна",
-        // From Михаил (Mikhail)
-        "михайлович", "михайловна",
-        // From Андрей (Andrey)
-        "андреевич", "андреевна",
-        // From Николай (Nikolay)
-        "николаевич", "николаевна",
-        // From Владимир (Vladimir)
-        "владимирович", "владимировна",
-        // From Алексей (Alexey)
-        "алексеевич", "алексеевна",
-        // From Павел (Pavel)
-        "павлович", "павловна",
-        // From Георгий (George)
-        "георгиевич", "георгиевна",
-        // From Борис (Boris)
-        "борисович", "борисовна",
-        // From Юрий (Yuri)
-        "юрьевич", "юрьевна",
-        // From Фёдор (Fyodor)
-        "фёдорович", "фёдоровна", "федорович", "федоровна",
-        // From Степан (Stepan)
-        "степанович", "степановна",
-        // From Константин (Konstantin)
-        "константинович", "константиновна",
-        // From Леонид (Leonid)
-        "леонидович", "леонидовна",
-        // From Евгений (Evgeny)
-        "евгеньевич", "евгеньевна",
-        // From Анатолий (Anatoly)
-        "анатольевич", "анатольевна",
-        // From Виктор (Viktor)
-        "викторович", "викторовна",
-    };
-
     // Common Russian words that collide with Armenian name stems
     static RUSSIAN_COMMON_WORDS: phf::Set<&'static str> = phf_set! {
         "торосы",
@@ -281,11 +232,6 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> impl Iterator<Item = Str
         .filter(|word| !word.is_empty())
         .filter_map(|word| {
             let lower = word.to_lowercase();
-
-            // Skip specific Russian patronymics that cause false positives
-            if RUSSIAN_PATRONYMICS.contains(lower.as_str()) {
-                return None;
-            }
 
             // Skip common Russian words that collide with Armenian stems
             if RUSSIAN_COMMON_WORDS.contains(lower.as_str()) {
