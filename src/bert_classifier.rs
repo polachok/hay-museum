@@ -1,10 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use candle_core::{Device, IndexOp, Module, Tensor};
-use candle_nn::{linear, Linear, VarBuilder};
+use candle_nn::ops::softmax;
+use candle_nn::{Linear, VarBuilder, linear};
 use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::{api::sync::Api, Repo, RepoType};
-use tokenizers::Tokenizer;
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::path::Path;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
 /// Model type selection for BERT classifier
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +43,7 @@ pub struct BertClassifier {
     pub russian_prototypes: Vec<(String, Tensor)>,
     /// Classification head for fine-tuned models (None for embedding-only models)
     classifier: Option<Linear>,
+    pooler: Option<Linear>,
 }
 
 impl BertClassifier {
@@ -91,20 +93,23 @@ impl BertClassifier {
             .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
         eprintln!("Loading model weights...");
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)? };
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)?
+        };
 
         // Load BERT base model
         let model = BertModel::load(vb.pp("bert"), &config)?;
 
         // Load classifier head if it's a fine-tuned model
-        let classifier = if matches!(model_type, ModelType::FineTunedArmenian) {
+        let (classifier, pooler) = if matches!(model_type, ModelType::FineTunedArmenian) {
             eprintln!("Loading classification head...");
             let hidden_size = config.hidden_size;
             let num_labels = 2;
+            let pooler = linear(hidden_size, hidden_size, vb.pp("bert.pooler.dense"))?;
             let classifier = linear(hidden_size, num_labels, vb.pp("classifier"))?;
-            Some(classifier)
+            (Some(classifier), Some(pooler))
         } else {
-            None
+            (None, None)
         };
 
         eprintln!("Model loaded successfully!");
@@ -121,6 +126,7 @@ impl BertClassifier {
             armenian_prototypes,
             russian_prototypes,
             classifier,
+            pooler,
         })
     }
 
@@ -137,7 +143,14 @@ impl BertClassifier {
             }
         }
         */
-        Ok(Device::Cpu)
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Device::Cpu)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Device::new_cuda(0)?)
+        }
     }
 
     /// Create category-specific Armenian prototype embeddings
@@ -197,25 +210,27 @@ impl BertClassifier {
             // Encode all phrases in this category
             let embeddings: Vec<Tensor> = phrases
                 .iter()
-                .filter_map(|phrase| {
-                    match self.encode_text(phrase) {
-                        Ok(emb) => Some(emb),
-                        Err(e) => {
-                            eprintln!("  Warning: Failed to encode '{}': {}", phrase, e);
-                            None
-                        }
+                .filter_map(|phrase| match self.encode_text(phrase) {
+                    Ok(emb) => Some(emb),
+                    Err(e) => {
+                        eprintln!("  Warning: Failed to encode '{}': {}", phrase, e);
+                        None
                     }
                 })
                 .collect();
 
             if embeddings.is_empty() {
-                return Err(anyhow!("Failed to create embeddings for category: {}", category));
+                return Err(anyhow!(
+                    "Failed to create embeddings for category: {}",
+                    category
+                ));
             }
 
             // Average the embeddings
             let avg_embedding = Self::average_tensors(&embeddings)?;
 
-            self.armenian_prototypes.push((category.to_string(), avg_embedding));
+            self.armenian_prototypes
+                .push((category.to_string(), avg_embedding));
             eprintln!("  Created prototype for '{}' category", category);
         }
 
@@ -320,23 +335,25 @@ impl BertClassifier {
         for (category, phrases) in prototypes {
             let embeddings: Vec<Tensor> = phrases
                 .iter()
-                .filter_map(|phrase| {
-                    match self.encode_text(phrase) {
-                        Ok(emb) => Some(emb),
-                        Err(e) => {
-                            eprintln!("  Warning: Failed to encode '{}': {}", phrase, e);
-                            None
-                        }
+                .filter_map(|phrase| match self.encode_text(phrase) {
+                    Ok(emb) => Some(emb),
+                    Err(e) => {
+                        eprintln!("  Warning: Failed to encode '{}': {}", phrase, e);
+                        None
                     }
                 })
                 .collect();
 
             if embeddings.is_empty() {
-                return Err(anyhow!("Failed to create embeddings for category: {}", category));
+                return Err(anyhow!(
+                    "Failed to create embeddings for category: {}",
+                    category
+                ));
             }
 
             let avg_embedding = Self::average_tensors(&embeddings)?;
-            self.russian_prototypes.push((category.to_string(), avg_embedding));
+            self.russian_prototypes
+                .push((category.to_string(), avg_embedding));
             eprintln!("  Created negative prototype for '{}' category", category);
         }
 
@@ -346,7 +363,8 @@ impl BertClassifier {
 
     /// Encode a single text into embedding
     pub fn encode_text(&self, text: &str) -> Result<Tensor> {
-        let mut encoding = self.tokenizer
+        let mut encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
 
@@ -354,8 +372,7 @@ impl BertClassifier {
         encoding.truncate(1024, 0, tokenizers::TruncationDirection::Right);
 
         let tokens = encoding.get_ids();
-        let token_ids = Tensor::new(tokens.to_vec(), &self.device)?
-            .unsqueeze(0)?; // Add batch dimension
+        let token_ids = Tensor::new(tokens.to_vec(), &self.device)?.unsqueeze(0)?; // Add batch dimension
 
         // Forward pass through BERT
         // BERT forward signature: forward(input_ids, token_type_ids, attention_mask)
@@ -371,13 +388,19 @@ impl BertClassifier {
     /// Encode a batch of texts
     #[allow(dead_code)]
     pub fn encode_batch(&self, texts: &[String]) -> Result<Vec<Tensor>> {
-        texts.iter()
-            .map(|text| self.encode_text(text))
-            .collect()
+        texts.iter().map(|text| self.encode_text(text)).collect()
     }
 
     /// Score a single record's Armenian relevance
     pub fn score_armenian_relevance(&self, text: &str) -> Result<f32> {
+        let res = self.score_armenian_relevance_(text);
+        if let Err(err) = &res {
+            eprintln!("{:?}", err);
+        }
+        res
+    }
+    /// Score a single record's Armenian relevance
+    pub fn score_armenian_relevance_(&self, text: &str) -> Result<f32> {
         // Use fine-tuned classifier if available
         if let Some(classifier) = &self.classifier {
             return self.score_with_classifier(text, classifier);
@@ -385,7 +408,9 @@ impl BertClassifier {
 
         // Otherwise use prototype-based scoring
         if self.armenian_prototypes.is_empty() {
-            return Err(anyhow!("Armenian prototypes not initialized. Call create_armenian_prototypes() first."));
+            return Err(anyhow!(
+                "Armenian prototypes not initialized. Call create_armenian_prototypes() first."
+            ));
         }
 
         // Encode the record text
@@ -432,14 +457,14 @@ impl BertClassifier {
     /// Score using fine-tuned classifier
     fn score_with_classifier(&self, text: &str, classifier: &Linear) -> Result<f32> {
         // Tokenize and encode
-        let mut encoding = self.tokenizer
+        let mut encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         encoding.truncate(1024, 0, tokenizers::TruncationDirection::Right);
 
         let tokens = encoding.get_ids();
-        let token_ids = Tensor::new(tokens.to_vec(), &self.device)?
-            .unsqueeze(0)?;
+        let token_ids = Tensor::new(tokens.to_vec(), &self.device)?.unsqueeze(0)?;
 
         // Forward pass through BERT
         let token_type_ids = token_ids.zeros_like()?;
@@ -451,28 +476,87 @@ impl BertClassifier {
 
         // Pass through classifier
         let logits = classifier.forward(&cls_embedding)?; // Shape: [1, 2]
-        let logits = logits.squeeze(0)?; // Shape: [2]
+        let probs = softmax(&logits, candle_core::D::Minus1)?;
 
-        // Get probability for "armenian" class (label 1)
-        // Apply softmax and return probability
-        let logits_vec = logits.to_vec1::<f32>()?;
-        let armenian_logit = logits_vec[1];
-        let not_armenian_logit = logits_vec[0];
+        let prob_armenian = probs.i((0, 1))?.to_scalar::<f32>()?;
+        // let logits = logits.squeeze(0)?; // Shape: [2]
 
-        // Softmax: exp(x_i) / sum(exp(x_j))
-        let exp_armenian = armenian_logit.exp();
-        let exp_not_armenian = not_armenian_logit.exp();
-        let prob_armenian = exp_armenian / (exp_armenian + exp_not_armenian);
+        // // Get probability for "armenian" class (label 1)
+        // // Apply softmax and return probability
+        // let logits_vec = logits.to_vec1::<f32>()?;
+        // let armenian_logit = logits_vec[1];
+        // let not_armenian_logit = logits_vec[0];
+
+        // // Softmax: exp(x_i) / sum(exp(x_j))
+        // let exp_armenian = armenian_logit.exp();
+        // let exp_not_armenian = not_armenian_logit.exp();
+        // let prob_armenian = exp_armenian / (exp_armenian + exp_not_armenian);
 
         Ok(prob_armenian)
     }
 
     /// Score a batch of records
-    #[allow(dead_code)]
-    pub fn score_batch(&self, texts: &[String]) -> Result<Vec<f32>> {
-        texts.iter()
-            .map(|text| self.score_armenian_relevance(text))
-            .collect()
+    pub fn score_batch(&self, texts: &[&str]) -> Result<Vec<f32>> {
+        let Some(classifier) = &self.classifier else {
+            anyhow::bail!("no classifier");
+        };
+        let Some(pooler) = &self.pooler else {
+            anyhow::bail!("no pooler");
+        };
+        let mut tokenizer = self.tokenizer.clone();
+        let tokenizer = tokenizer
+            .with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::BatchLongest,
+                ..Default::default()
+            }))
+            .with_truncation(Some(TruncationParams {
+                max_length: 1024 + 512,
+                strategy: TruncationStrategy::LongestFirst,
+                ..Default::default()
+            }))
+            .unwrap();
+
+        let encodings = tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| anyhow!("Batch tokenization failed: {}", e))?;
+
+        // 2. Prepare Tensors
+        let mut all_ids = Vec::new();
+        for encoding in encodings {
+            all_ids.push(Tensor::new(encoding.get_ids(), &self.device)?);
+        }
+
+        // Stack individual tensors into a batch: [batch_size, seq_len]
+        let token_ids = Tensor::stack(&all_ids, 0)?;
+        let token_type_ids = token_ids.zeros_like()?;
+
+        // 3. GPU Forward Pass
+        let embeddings = self.model.forward(&token_ids, &token_type_ids, None)?;
+
+        // 4. Extract CLS tokens for the entire batch
+        // We take index 0 from the sequence dimension (dim 1)
+        let cls_embeddings = embeddings.narrow(1, 0, 1)?.squeeze(1)?; // [batch_size, hidden_size]
+
+        // FIX: Force the tensor into a contiguous memory layout for CUDA
+        let cls_embeddings = cls_embeddings.contiguous()?;
+
+        // 1. Pass through Pooler Dense Layer
+        let pooled_output = pooler.forward(&cls_embeddings)?;
+        // 2. Apply Tanh Activation
+        let pooled_output = pooled_output.tanh()?;
+
+        // 5. Classifier + Softmax
+        let logits = classifier.forward(&pooled_output)?;
+        let probs = softmax(&logits, candle_core::D::Minus1)?; // [batch_size, 2]
+
+        // 6. Convert to Vec for final output
+        // This moves the results from GPU to CPU in one single block
+        let probs_vec = probs.to_vec2::<f32>()?;
+
+        // Extract the "Armenian" probability (index 1) for each item in the batch
+        let scores = probs_vec.iter().map(|p| p[1]).collect();
+
+        Ok(scores)
     }
 
     /// Check if text contains Armenian characters (U+0530-058F)
@@ -496,7 +580,8 @@ impl BertClassifier {
             return Err(anyhow!("Cannot average empty tensor list"));
         }
 
-        let sum = tensors.iter()
+        let sum = tensors
+            .iter()
             .skip(1)
             .try_fold(tensors[0].clone(), |acc, t| acc.add(t))?;
 
@@ -508,7 +593,7 @@ impl BertClassifier {
     fn mean_pool(embeddings: &Tensor) -> Result<Tensor> {
         // embeddings shape: [batch_size, seq_len, hidden_size]
         // We want: [batch_size, hidden_size]
-        let sum = embeddings.sum(1)?;  // Sum over seq_len dimension
+        let sum = embeddings.sum(1)?; // Sum over seq_len dimension
         let seq_len = embeddings.dim(1)? as f64;
         Ok(sum.affine(1.0 / seq_len, 0.0)?)
     }
@@ -521,7 +606,9 @@ mod tests {
     #[test]
     fn test_armenian_char_detection() {
         assert!(BertClassifier::has_armenian_characters("Հայաստան"));
-        assert!(BertClassifier::has_armenian_characters("армянский Հայերեն текст"));
+        assert!(BertClassifier::has_armenian_characters(
+            "армянский Հայերեն текст"
+        ));
         assert!(!BertClassifier::has_armenian_characters("русский текст"));
         assert!(!BertClassifier::has_armenian_characters(""));
     }

@@ -109,9 +109,7 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
                 // Filter out short stems and Russian stems
-                if stem.chars().count() >= 4
-                    && !RUSSIAN_STEMS.contains(stem.as_str())
-                {
+                if stem.chars().count() >= 4 && !RUSSIAN_STEMS.contains(stem.as_str()) {
                     Some(stem)
                 } else {
                     None
@@ -390,12 +388,10 @@ fn preprocess_parquet(input_path: &str, output_path: &str, filters: &Filters) ->
             .is_not_null()
             .and(col("productionPlace").str().len_bytes().gt(0))
             .and(col("productionPlace").contains_word_case_insensitive(&filters.geonames)))
-        .or(
-            col("findPlace")
-                .is_not_null()
-                .and(col("findPlace").str().len_bytes().gt(0))
-                .and(col("findPlace").contains_word_case_insensitive(&filters.geonames))
-        )
+        .or(col("findPlace")
+            .is_not_null()
+            .and(col("findPlace").str().len_bytes().gt(0))
+            .and(col("findPlace").contains_word_case_insensitive(&filters.geonames)))
         .alias("matched_geonames"),
     )
     // Add column to track if matched by keywords/names (needs BERT validation)
@@ -490,37 +486,61 @@ fn main() -> Result<(), Error> {
             when(col("matched_keywords_or_names").and(col("matched_geonames").not()))
                 .then(
                     // Match training data format: use " | " separator and "Автор: " prefix
-                    concat_str([
-                        col("name"),
-                        col("description"),
-                        when(col("authors").list().len().gt(0))
-                            .then(concat_str([lit("Автор: "), col("authors").list().join(lit(", "), true)], "", false))
-                            .otherwise(lit("")),
-                    ], " | ", true)
-                        .map(
-                            move |c: Column| {
-                                let c = c.str()?;
-                                let classifier_clone = classifier_clone.clone();
-                                let progress_clone = progress_clone.clone();
+                    concat_str(
+                        [
+                            col("name"),
+                            col("description"),
+                            when(col("authors").list().len().gt(0))
+                                .then(concat_str(
+                                    [lit("Автор: "), col("authors").list().join(lit(", "), true)],
+                                    "",
+                                    false,
+                                ))
+                                .otherwise(lit("")),
+                        ],
+                        " | ",
+                        true,
+                    )
+                    .map(
+                        move |c: Column| {
+                            let c = c.str()?;
+                            let classifier_clone = classifier_clone.clone();
+                            let progress_clone = progress_clone.clone();
 
-                                let res: Float32Chunked = c
-                                    .into_iter()
-                                    .map(move |text: Option<&str>| -> Option<f32> {
-                                        let classifier = classifier_clone.clone();
-                                        let count = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                            use itertools::Itertools;
 
-                                        // Log progress every 1000 records
-                                        if count.is_multiple_of(1000) {
-                                            eprintln!("Scored {} records", count);
-                                        }
+                            let res: Float32Chunked = c
+                                .into_iter()
+                                .chunks(16)
+                                .into_iter()
+                                .map(move |chunk| {
+                                    let chunk: Vec<&str> = chunk
+                                        .into_iter()
+                                        .map(|x: Option<&str>| x.unwrap_or_default())
+                                        .collect();
 
-                                        text.and_then(move |t| classifier.score_armenian_relevance(t).ok())
-                                    })
-                                    .collect();
-                                Ok(Column::new("armenian_score".into(), res.into_series()))
-                            },
-                            |_, _| Ok(Field::new("armenian_score".into(), DataType::Float32)),
-                        ),
+                                    let classifier = classifier_clone.clone();
+                                    let count = progress_clone
+                                        .fetch_add(chunk.len(), Ordering::Relaxed)
+                                        + chunk.len();
+
+                                    // Log progress every 1000 records
+                                    if count.is_multiple_of(1024) {
+                                        eprintln!("Scored {} records", count);
+                                    }
+
+                                    classifier
+                                        .score_batch(&chunk)
+                                        .unwrap()
+                                        .into_iter()
+                                        .map(Some)
+                                })
+                                .flatten()
+                                .collect();
+                            Ok(Column::new("armenian_score".into(), res.into_series()))
+                        },
+                        |_, _| Ok(Field::new("armenian_score".into(), DataType::Float32)),
+                    ),
                 )
                 .otherwise(lit(1.0f32)) // Geoname matches get perfect score (skip BERT)
                 .alias("armenian_score"),
@@ -528,7 +548,10 @@ fn main() -> Result<(), Error> {
         // Filter: keep all geoname matches, and keyword/name matches above threshold
         .filter(col("matched_geonames").or(col("armenian_score").gt_eq(lit(BERT_THRESHOLD))))
         // Drop temporary columns used for filtering
-        .drop(by_name(["matched_geonames", "matched_keywords_or_names"], false))
+        .drop(by_name(
+            ["matched_geonames", "matched_keywords_or_names"],
+            false,
+        ))
         .with_new_streaming(true)
         .sink_json(
             SinkTarget::Path(PlPath::from_str("result.json")),
