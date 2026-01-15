@@ -13,6 +13,8 @@ use mimalloc::MiMalloc;
 mod bert_classifier;
 use bert_classifier::{BertClassifier, ModelType};
 
+use indicatif::ProgressBar;
+
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -120,7 +122,7 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
     Ok(Series::new(series.name().clone(), stemmed))
 }
 
-fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
+fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> impl Iterator<Item = String> {
     // Common Russian patronymics that cause false positives with Armenian surnames
     static RUSSIAN_PATRONYMICS: phf::Set<&'static str> = phf_set! {
         // From Василий (Vasily)
@@ -297,29 +299,65 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> Vec<String> {
                 None
             }
         })
-        .collect()
 }
 
 fn preprocess_parquet(input_path: &str, output_path: &str, filters: &Filters) -> Result<(), Error> {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     eprintln!("Preprocessing parquet file...");
 
     // Prepare filter series for keyword matching
-    let mut description_filter = Series::new_empty("desc".into(), &DataType::String);
-    description_filter.append(&filters.names)?;
-    description_filter.append(&filters.midnames)?;
-    description_filter.append(&filters.surnames)?;
-    description_filter.append(&filters.keywords)?;
-    let description_filter = description_filter.unique()?.rechunk();
+    //
+    let mut filter_set: HashSet<String> = HashSet::new();
+    for list in [
+        &filters.names,
+        &filters.midnames,
+        &filters.surnames,
+        &filters.keywords,
+        &filters.geonames,
+    ] {
+        for word in list
+            .str()
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .flat_map(|opt| opt.into_iter())
+        {
+            filter_set.insert(word.to_lowercase());
+        }
+    }
+    let filter_set = Arc::new(filter_set);
+    let filter_set_1 = filter_set.clone();
 
-    eprintln!("Total filter terms: {}", description_filter.len());
+    eprintln!("Total filter terms: {}", filter_set.len());
     eprintln!("Geonames filter terms: {}", filters.geonames.len());
 
     let stemmer = Arc::new(Stemmer::create(Algorithm::Russian));
 
     let stemmer_clone1 = stemmer.clone();
     let stemmer_clone2 = stemmer.clone();
+
+    fn filter_column(
+        col: Column,
+        output_name: &'static str,
+        stemmer: &Stemmer,
+        filter: &HashSet<String>,
+    ) -> PolarsResult<Column> {
+        let s = col.str()?;
+        let values: BooleanChunked = s
+            .into_iter()
+            .map(|opt_val| {
+                opt_val
+                    .map(|val| {
+                        stem_text_to_words(val, &stemmer)
+                            .into_iter()
+                            .any(|word| filter.contains(&word))
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        Ok(Column::new(output_name.into(), values.into_series()))
+    }
 
     let lf = LazyFrame::scan_parquet(
         PlPath::from_str(input_path),
@@ -332,55 +370,26 @@ fn preprocess_parquet(input_path: &str, output_path: &str, filters: &Filters) ->
         col("name")
             .map(
                 move |col: Column| {
-                    let s = col.as_materialized_series();
-                    let values: Vec<AnyValue> = s
-                        .str()?
-                        .into_iter()
-                        .map(|opt_val| {
-                            let words = opt_val
-                                .map(|val| stem_text_to_words(val, &stemmer_clone1))
-                                .unwrap_or_default();
-                            let word_series = Series::from_iter(words);
-                            AnyValue::List(word_series)
-                        })
-                        .collect();
-                    Ok(Series::from_any_values(s.name().clone(), &values, false)?.into())
+                    filter_column(col, "matched_name", &stemmer_clone1, &filter_set.clone())
                 },
-                |_schema, _fields| {
-                    Ok(Field::new(
-                        "name_stemmed".into(),
-                        DataType::List(Box::new(DataType::String)),
-                    ))
-                },
+                |_schema, _fields| Ok(Field::new("matched_name".into(), DataType::Boolean)),
             )
-            .alias("name_stemmed"),
+            .alias("matched_name"),
     )
     .with_column(
         col("description")
             .map(
                 move |col: Column| {
-                    let s = col.as_materialized_series();
-                    let values: Vec<AnyValue> = s
-                        .str()?
-                        .into_iter()
-                        .map(|opt_val| {
-                            let words = opt_val
-                                .map(|val| stem_text_to_words(val, &stemmer_clone2))
-                                .unwrap_or_default();
-                            let word_series = Series::from_iter(words);
-                            AnyValue::List(word_series)
-                        })
-                        .collect();
-                    Ok(Series::from_any_values(s.name().clone(), &values, false)?.into())
+                    filter_column(
+                        col,
+                        "matched_description",
+                        &stemmer_clone2,
+                        &filter_set_1.clone(),
+                    )
                 },
-                |_schema, _fields| {
-                    Ok(Field::new(
-                        "description_stemmed".into(),
-                        DataType::List(Box::new(DataType::String)),
-                    ))
-                },
+                |_schema, _fields| Ok(Field::new("matched_description".into(), DataType::Boolean)),
             )
-            .alias("description_stemmed"),
+            .alias("matched_description"),
     )
     // Add column to track if matched by geonames (reliable, no BERT needed)
     .with_column(
@@ -394,26 +403,15 @@ fn preprocess_parquet(input_path: &str, output_path: &str, filters: &Filters) ->
             .and(col("findPlace").contains_word_case_insensitive(&filters.geonames)))
         .alias("matched_geonames"),
     )
-    // Add column to track if matched by keywords/names (needs BERT validation)
     .with_column(
-        col("name_stemmed")
-            .list()
-            .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
-            .list()
-            .sum()
-            .gt(0)
-            .or(col("description_stemmed")
-                .list()
-                .eval(col("").is_in(lit(description_filter.clone()).implode(), false))
-                .list()
-                .sum()
-                .gt(0))
+        col("matched_name")
+            .or(col("matched_description"))
             .alias("matched_keywords_or_names"),
     )
     // Filter to only records that matched something
     .filter(col("matched_geonames").or(col("matched_keywords_or_names")))
     // Drop stemmed columns - no longer needed after filtering
-    .drop(by_name(["name_stemmed", "description_stemmed"], false));
+    .drop(by_name(["matched_name", "matched_description"], false));
 
     eprintln!("Writing preprocessed (filtered) parquet...");
     lf.sink_parquet(
@@ -463,6 +461,11 @@ fn main() -> Result<(), Error> {
     // Load preprocessed data (already filtered by keywords/geonames)
     let lf = LazyFrame::scan_parquet(PlPath::from_str(preprocessed_path), Default::default())?;
 
+    let df = lf.clone().select([len()]).collect()?;
+
+    let records_count = df.column("len")?.u32()?.get(0).unwrap();
+
+    println!("Loaded preprocessed parquet. records: {}", records_count);
     // Initialize BERT classifier for semantic scoring
     eprintln!("Initializing BERT classifier...");
     let classifier = BertClassifier::load_with_model(ModelType::FineTunedArmenian)?;
@@ -473,13 +476,13 @@ fn main() -> Result<(), Error> {
 
     let classifier = Arc::new(classifier);
 
-    const BERT_THRESHOLD: f32 = 0.44;
+    const BERT_THRESHOLD: f32 = 0.4;
 
     // Apply BERT scoring to all records
     // Geoname matches get 1.0, keyword/name matches get BERT scored
     let classifier_clone = classifier.clone();
-    let progress_counter = Arc::new(AtomicUsize::new(0));
-    let progress_clone = progress_counter.clone();
+
+    let pb = Arc::new(ProgressBar::new(records_count as u64).with_prefix("Scoring"));
 
     let _ = lf
         .with_column(
@@ -505,9 +508,10 @@ fn main() -> Result<(), Error> {
                         move |c: Column| {
                             let c = c.str()?;
                             let classifier_clone = classifier_clone.clone();
-                            let progress_clone = progress_clone.clone();
 
                             use itertools::Itertools;
+
+                            let pb = pb.clone();
 
                             let res: Float32Chunked = c
                                 .into_iter()
@@ -520,14 +524,8 @@ fn main() -> Result<(), Error> {
                                         .collect();
 
                                     let classifier = classifier_clone.clone();
-                                    let count = progress_clone
-                                        .fetch_add(chunk.len(), Ordering::Relaxed)
-                                        + chunk.len();
 
-                                    // Log progress every 1000 records
-                                    if count.is_multiple_of(1024) {
-                                        eprintln!("Scored {} records", count);
-                                    }
+                                    pb.inc(chunk.len() as u64);
 
                                     classifier
                                         .score_batch(&chunk)
