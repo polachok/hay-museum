@@ -21,7 +21,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 // Stems to filter out to prevent false positives with Armenian surnames
 // These are checked AFTER stemming, so values here should be stems
 static RUSSIAN_STEMS: phf::Set<&'static str> = phf_set! {
-    "потеря", "крестья", "емельян", "емелья",
     "василь", // from Васильян, matches Васильевич
     "грабар", // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
     "андрия", // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
@@ -130,26 +129,6 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> impl Iterator<Item = Str
         "торосами",
         "торосах", // ice ridges (plural/oblique cases) - collides with Armenian name Торос
         // Note: "торос" (singular nominative) is NOT blacklisted as it could be the Armenian name
-        "григорий",
-        "григория",
-        "григорию",
-        "григорием",
-        "григорье", // Russian first name Gregory - collides with Григорян surname
-        "григорьев",
-        "григорьева",
-        "григорьеву",
-        "григорьевым",
-        "григорьеве", // Russian surname Grigoryev - collides with Григорян surname
-        "арсений",
-        "арсения",
-        "арсению",
-        "арсением",
-        "арсенье", // Russian first name Arseny - collides with Armenian name Арсен
-        "арсеньев",
-        "арсеньева",
-        "арсеньеву",
-        "арсеньевым",
-        "арсеньеве", // Russian surname Arsenyev - collides with Armenian name Арсен
         "тиграи",
         "тиграев",
         "тиграям",
@@ -160,21 +139,6 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> impl Iterator<Item = Str
         "тиграйца",
         "тиграйцев",
         "тиграйцам",
-        "николай",
-        "николая",
-        "николаю",
-        "николаем",
-        "николае", // Russian first name Nikolay - collides with Armenian surname Николаян
-        "куприян",
-        "куприяна",
-        "куприяну",
-        "куприяном",
-        "куприяне", // Russian first name Kupriyan (from Cyprian) - false positive for Armenian content
-        "лукьян",
-        "лукьяна",
-        "лукьяну",
-        "лукьяном",
-        "лукьяне", // Russian first name Lukyan (from Latin Lucianus) - false positive for Armenian content
         "бурьян",
         "бурьяна",
         "бурьяну",
