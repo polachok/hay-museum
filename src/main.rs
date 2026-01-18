@@ -109,7 +109,9 @@ fn stem_series(series: &Series, stemmer: &Stemmer) -> Result<Series, Error> {
             opt_val.and_then(|val| {
                 let stem = stemmer.stem(val).into_owned();
                 // Filter out short stems and Russian stems
-                if stem.chars().count() >= 4 && !RUSSIAN_STEMS.contains(stem.as_str()) {
+                if stem.chars().count() >= 4
+                /* && !RUSSIAN_STEMS.contains(stem.as_str()) */
+                {
                     Some(stem)
                 } else {
                     None
