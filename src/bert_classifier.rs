@@ -130,27 +130,24 @@ impl BertClassifier {
         })
     }
 
-    /// Select best available device (Metal GPU on M1 Mac, or CPU fallback)
+    /// Select best available device based on compile-time features
     fn select_device() -> Result<Device> {
-        // Note: Metal backend currently missing layer-norm implementation for BERT
-        // Falling back to CPU until Candle Metal support is complete
-        // TODO: Re-enable Metal when layer-norm is supported
-        /*
-        #[cfg(target_os = "macos")]
+        #[cfg(feature = "cuda")]
         {
+            return Ok(Device::new_cuda(0)?);
+        }
+
+        #[cfg(feature = "metal")]
+        {
+            // Note: Metal backend may have incomplete layer-norm implementation for BERT
+            // If it fails, we fall back to CPU below
             if let Ok(device) = Device::new_metal(0) {
                 return Ok(device);
             }
         }
-        */
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Device::Cpu)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(Device::new_cuda(0)?)
-        }
+
+        // Default: CPU
+        Ok(Device::Cpu)
     }
 
     /// Create category-specific Armenian prototype embeddings
