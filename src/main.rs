@@ -10,7 +10,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 use mimalloc::MiMalloc;
 
 mod bert_classifier;
-use bert_classifier::{BertClassifier, ModelType};
+use bert_classifier::BertClassifier;
 
 use indicatif::ProgressBar;
 
@@ -380,11 +380,7 @@ fn main() -> Result<(), Error> {
     println!("Loaded preprocessed parquet. records: {}", records_count);
     // Initialize BERT classifier for semantic scoring
     eprintln!("Initializing BERT classifier...");
-    let classifier = BertClassifier::load_with_model(ModelType::FineTunedArmenian)?;
-
-    // Fine-tuned model doesn't need prototypes
-    // classifier.create_armenian_prototypes()?;
-    // classifier.create_russian_prototypes()?;
+    let classifier = BertClassifier::load()?;
 
     let classifier = Arc::new(classifier);
 
