@@ -17,20 +17,6 @@ use indicatif::ProgressBar;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// Exclude stems that match Russian words, names, and patronymics
-// Stems to filter out to prevent false positives with Armenian surnames
-// These are checked AFTER stemming, so values here should be stems
-static RUSSIAN_STEMS: phf::Set<&'static str> = phf_set! {
-    "василь", // from Васильян, matches Васильевич
-    "грабар", // classical Armenian word, but matches Russian artist И.Э.Грабарь (Igor Grabar)
-    "андрия", // Armenian surname Андриян, but matches Russian first name Андриян (e.g. cosmonaut)
-    "демья",  // from Демьян (Armenian surname), matches Демьян (Russian first name)
-    "татья",  // from Татьян (Armenian surname), matches Татьяна (Russian first name)
-    "оловя", // from Оловян (Armenian surname), matches оловянный (Russian: tin/pewter - very common in museum items)
-    "сафья", // from Сафьян (Armenian surname), matches сафьян (Russian: morocco leather - common in book bindings)
-    "арсень", // from Арсеньев (Russian surname), matches Armenian name Арсен
-};
-
 struct Filters {
     names: Series,
     midnames: Series,
@@ -205,7 +191,7 @@ fn stem_text_to_words(text: &str, stemmer: &Stemmer) -> impl Iterator<Item = Str
             }
 
             let stem = stemmer.stem(&lower).into_owned();
-            if stem.chars().count() >= 4 && !RUSSIAN_STEMS.contains(stem.as_str()) {
+            if stem.chars().count() >= 4 {
                 Some(stem)
             } else {
                 None
