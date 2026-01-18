@@ -388,7 +388,7 @@ fn main() -> Result<(), Error> {
 
     let classifier = Arc::new(classifier);
 
-    const BERT_THRESHOLD: f32 = 0.4;
+    const BERT_THRESHOLD: f32 = 0.25;
 
     // Apply BERT scoring to all records
     // Geoname matches get 1.0, keyword/name matches get BERT scored
