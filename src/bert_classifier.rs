@@ -522,16 +522,24 @@ impl BertClassifier {
 
         // 2. Prepare Tensors
         let mut all_ids = Vec::new();
+        let mut all_masks = Vec::new();
         for encoding in encodings {
             all_ids.push(Tensor::new(encoding.get_ids(), &self.device)?);
+            // Get the mask from the tokenizer
+            let mask_u32 = encoding.get_attention_mask();
+            // Convert to Tensor
+            all_masks.push(Tensor::new(mask_u32, &self.device)?);
         }
 
         // Stack individual tensors into a batch: [batch_size, seq_len]
         let token_ids = Tensor::stack(&all_ids, 0)?;
+        let attention_mask = Tensor::stack(&all_masks, 0)?;
         let token_type_ids = token_ids.zeros_like()?;
 
         // 3. GPU Forward Pass
-        let embeddings = self.model.forward(&token_ids, &token_type_ids, None)?;
+        let embeddings = self
+            .model
+            .forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
 
         // 4. Extract CLS tokens for the entire batch
         // We take index 0 from the sequence dimension (dim 1)
@@ -554,7 +562,14 @@ impl BertClassifier {
         let probs_vec = probs.to_vec2::<f32>()?;
 
         // Extract the "Armenian" probability (index 1) for each item in the batch
-        let scores = probs_vec.iter().map(|p| p[1]).collect();
+        let mut scores: Vec<_> = probs_vec.iter().map(|p| p[1]).collect();
+
+        // Add armenian character boost
+        for (idx, text) in texts.iter().enumerate() {
+            if Self::has_armenian_characters(&text) {
+                scores[idx] = (scores[idx] * 2.0).min(1.0)
+            }
+        }
 
         Ok(scores)
     }
